@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ITECH IT-N6332B — Triple-Channel Control</title>
+  <title>ITECH IT-N6332B — Control Panel</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -12,29 +12,22 @@
       <span class="logo">⎓</span>
       <div>
         <h1>IT-N6332B</h1>
-        <p class="subtitle">Triple-Channel Programmable DC Power Supply · SCPI</p>
+        <p class="subtitle">Bidirectional Programmable DC Power Supply · SCPI</p>
       </div>
     </div>
-    <div class="conn-status" id="connStatus">
+    <div class="conn-status">
       <span class="dot" id="connDot"></span>
       <span id="connLabel">Disconnected</span>
     </div>
   </header>
 
   <main>
-    <!-- Connection -->
-    <section class="card" id="connectionCard">
+    <section class="card">
       <h2>Connection</h2>
       <div class="row">
-        <label>Host / IP
-          <input type="text" id="host" placeholder="192.168.1.50" value="192.168.1.50" />
-        </label>
-        <label>Port
-          <input type="number" id="port" value="30000" />
-        </label>
-        <label class="grow">VISA resource (optional)
-          <input type="text" id="visa" placeholder="USB0::0x2EC7::...::INSTR" />
-        </label>
+        <label>Host / IP<input type="text" id="host" placeholder="192.168.1.50" value="192.168.1.50" /></label>
+        <label>Port<input type="number" id="port" value="30000" /></label>
+        <label class="grow">VISA resource (optional)<input type="text" id="visa" placeholder="USB0::0x2EC7::...::INSTR" /></label>
       </div>
       <div class="row btn-row">
         <button class="btn primary" id="btnConnect">Connect</button>
@@ -44,53 +37,58 @@
       </div>
     </section>
 
-    <!-- Global controls -->
-    <section class="card" id="globalCard">
-      <h2>Master controls</h2>
-      <div class="row btn-row">
-        <button class="btn ok" id="btnAllOn" disabled>All outputs ON</button>
-        <button class="btn danger" id="btnAllOff" disabled>All outputs OFF</button>
-        <label>CH1+CH2 tracking
-          <select id="tracking" disabled>
-            <option value="OFF">Independent</option>
-            <option value="SERies">Series</option>
-            <option value="PARallel">Parallel</option>
-          </select>
-        </label>
-        <button class="btn" id="btnReset" disabled>*RST</button>
-      </div>
-    </section>
+    <div class="grid">
+      <section class="card readouts">
+        <h2>Measurements <span class="mode-badge" id="modeBadge">—</span></h2>
+        <div class="meters">
+          <div class="meter v"><span class="value" id="mVoltage">—</span><span class="unit">V</span><span class="caption">Voltage</span></div>
+          <div class="meter i"><span class="value" id="mCurrent">—</span><span class="unit">A</span><span class="caption">Current</span></div>
+          <div class="meter p"><span class="value" id="mPower">—</span><span class="unit">W</span><span class="caption">Power</span></div>
+        </div>
+        <canvas id="chart" width="640" height="220"></canvas>
+        <div class="legend">
+          <span><i class="swatch v"></i> Voltage (V)</span>
+          <span><i class="swatch i"></i> Current (A)</span>
+          <span class="hint">Current/power are signed: negative = sinking</span>
+        </div>
+      </section>
 
-    <!-- Channel cards get injected here -->
-    <div id="channels" class="channels"></div>
+      <section class="card controls">
+        <h2>Output</h2>
+        <div class="output-toggle">
+          <button class="bigtoggle off" id="btnOutput" disabled><span class="state">OUTPUT OFF</span></button>
+        </div>
+
+        <h2>Setpoints</h2>
+        <div class="row">
+          <label>Priority
+            <select id="priority">
+              <option value="VOLTAGE">Constant Voltage (CV)</option>
+              <option value="CURRENT">Constant Current (CC)</option>
+            </select>
+          </label>
+        </div>
+        <div class="row">
+          <label>Voltage (V)<input type="number" id="setVoltage" step="0.001" value="12.000" /></label>
+          <label>Current (A)<input type="number" id="setCurrent" step="0.001" value="2.000" /></label>
+        </div>
+        <div class="row btn-row"><button class="btn primary" id="btnApply" disabled>Apply setpoints</button></div>
+
+        <h2>Protection</h2>
+        <div class="row">
+          <label>OVP (V)<input type="number" id="ovp" step="0.1" placeholder="13.5" /></label>
+          <label>OCP (A)<input type="number" id="ocp" step="0.1" placeholder="2.5" /></label>
+          <label>OPP (W)<input type="number" id="opp" step="1" placeholder="60" /></label>
+        </div>
+        <div class="row btn-row">
+          <button class="btn" id="btnProt" disabled>Set protection</button>
+          <button class="btn warn" id="btnClearProt" disabled>Clear trip</button>
+          <button class="btn" id="btnReset" disabled>*RST</button>
+        </div>
+        <div class="prot-status ok" id="protStatus">Protection: —</div>
+      </section>
+    </div>
   </main>
-
-  <!-- Template for one channel card -->
-  <template id="channelTemplate">
-    <section class="card channel">
-      <div class="ch-head">
-        <h2 class="ch-name"></h2>
-        <span class="ch-rating"></span>
-        <span class="mode-badge">—</span>
-      </div>
-      <div class="meters">
-        <div class="meter v"><span class="value m-volt">—</span><span class="unit">V</span><span class="caption">Voltage</span></div>
-        <div class="meter i"><span class="value m-curr">—</span><span class="unit">A</span><span class="caption">Current</span></div>
-        <div class="meter p"><span class="value m-pow">—</span><span class="unit">W</span><span class="caption">Power</span></div>
-      </div>
-      <canvas class="chart" width="520" height="120"></canvas>
-      <div class="row">
-        <label>Voltage (V)<input type="number" class="set-volt" step="0.001" /></label>
-        <label>Current limit (A)<input type="number" class="set-curr" step="0.001" /></label>
-        <label>OVP (V)<input type="number" class="set-ovp" step="0.1" placeholder="off" /></label>
-      </div>
-      <div class="row btn-row">
-        <button class="btn primary btn-apply">Apply</button>
-        <button class="btn btn-ovp">Set OVP</button>
-        <button class="bigtoggle off btn-output"><span class="state">OUTPUT OFF</span></button>
-      </div>
-    </section>
-  </template>
 
   <div class="toast" id="toast"></div>
   <script src="app.js"></script>

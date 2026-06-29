@@ -1,4 +1,4 @@
-"""Tests for the triple-channel web UI backend, run against the simulator.
+"""Tests for the web UI backend, run against the built-in simulator (no hardware).
 
 Run with::
 
@@ -55,50 +55,38 @@ def test_static_index_served():
         assert "IT-N6332B" in body
 
 
-def test_connect_demo_reports_three_channels():
+def test_connect_demo_reports_ranges():
     with _Server() as s:
         status, st = s.call("POST", "/api/connect", {"demo": True})
         assert status == 200 and st["connected"] is True
-        assert len(st["channels"]) == 3
-        names = {c["name"] for c in st["channels"]}
-        assert names == {"CH1", "CH2", "CH3"}
-        ch3 = next(c for c in st["channels"] if c["name"] == "CH3")
-        assert ch3["max_voltage"] == 5.0 and ch3["max_current"] == 3.0
+        assert "IT-N6332B" in st["idn"]
+        assert st["priority"] in ("VOLTAGE", "CURRENT")
+        r = st["ranges"]
+        assert r["v_max"] > 0 and r["i_min"] < 0 < r["i_max"]  # bidirectional
 
 
-def test_channel_setpoint_and_measure():
+def test_setpoint_priority_and_measure():
     with _Server() as s:
         s.call("POST", "/api/connect", {"demo": True})
-        status, st = s.call("POST", "/api/channel/1/setpoint", {"voltage": 30, "current": 6})
-        assert status == 200
-        s.call("POST", "/api/channel/1/output", {"on": True})
+        status, st = s.call("POST", "/api/setpoint",
+                            {"voltage": 24, "current": 12, "priority": "VOLTAGE"})
+        assert status == 200 and st["priority"] == "VOLTAGE"
+        s.call("POST", "/api/output", {"on": True})
         _, m = s.call("GET", "/api/measure")
-        ch1 = next(c for c in m["channels"] if c["number"] == 1)
-        # 30 V into the simulator's 30 ohm load -> ~1 A.
-        assert abs(ch1["measurement"]["current"] - 1.0) < 0.3
+        # 24 V into the simulator's 12 ohm load -> ~2 A.
+        assert abs(m["measurement"]["current"] - 2.0) < 0.3
 
 
-def test_channel_range_rejected():
+def test_protection_roundtrip():
     with _Server() as s:
         s.call("POST", "/api/connect", {"demo": True})
-        # CH3 maxes at 5 V.
-        status, body = s.call("POST", "/api/channel/3/setpoint", {"voltage": 30})
-        assert status == 400
-        assert "range" in body["error"].lower()
-
-
-def test_all_output_toggle():
-    with _Server() as s:
-        s.call("POST", "/api/connect", {"demo": True})
-        _, m = s.call("POST", "/api/all_output", {"on": True})
-        assert all(c["output"] for c in m["channels"])
-        _, m = s.call("POST", "/api/all_output", {"on": False})
-        assert not any(c["output"] for c in m["channels"])
+        assert s.call("POST", "/api/protection", {"ovp": 13.5, "ocp": 2.5})[0] == 200
+        assert s.call("POST", "/api/clear_protection", {})[0] == 200
 
 
 def test_error_when_not_connected():
     with _Server() as s:
-        status, body = s.call("POST", "/api/channel/1/output", {"on": True})
+        status, body = s.call("POST", "/api/output", {"on": True})
         assert status == 400
         assert "connect" in body["error"].lower()
 
