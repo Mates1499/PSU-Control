@@ -1,4 +1,8 @@
-"""Tests for the multi-channel web UI backend (built-in simulator, no hardware).
+"""Tests for the multi-channel web UI backend.
+
+The server is started in-process.  Each test that needs an instrument spins up
+a MockInstrument or CPX200DPSimulator on a random port and connects via the
+regular host/port connect path (no demo mode).
 
 Run with::
 
@@ -17,6 +21,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from psu_control.web.server import create_server  # noqa: E402
+from psu_control.simulator import SimulatedInstrument, CPX200DPSimulator  # noqa: E402
 
 
 class _Server:
@@ -26,11 +31,14 @@ class _Server:
         self.ctrl = self.srv.RequestHandlerClass.controller
         self._t = threading.Thread(target=self.srv.serve_forever, daemon=True)
         self._t.start()
+        self._sim = None
         time.sleep(0.1)
         return self
 
     def __exit__(self, *exc):
         self.ctrl.disconnect()
+        if self._sim is not None:
+            self._sim.close()
         self.srv.shutdown()
         self.srv.server_close()
 
@@ -46,6 +54,22 @@ class _Server:
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read())
 
+    def connect_itn6332b(self, channels=3):
+        self._sim = SimulatedInstrument(channels=channels).start()
+        return self.call("POST", "/api/connect", {
+            "host": self._sim.host,
+            "port": self._sim.port,
+            "model": "itn6332b",
+        })
+
+    def connect_cpx200dp(self):
+        self._sim = CPX200DPSimulator().start()
+        return self.call("POST", "/api/connect", {
+            "host": self._sim.host,
+            "port": self._sim.port,
+            "model": "cpx200dp",
+        })
+
 
 def test_static_index_served():
     with _Server() as s:
@@ -55,11 +79,10 @@ def test_static_index_served():
         assert "IT-N6332B" in body
 
 
-def test_connect_demo_reports_channels():
+def test_connect_reports_channels():
     with _Server() as s:
-        status, st = s.call("POST", "/api/connect", {"demo": True})
+        status, st = s.connect_itn6332b()
         assert status == 200 and st["connected"] is True
-        # The simulator exposes 3 channels by default.
         assert [c["number"] for c in st["channels"]] == [1, 2, 3]
         ch1 = st["channels"][0]
         assert ch1["priority"] in ("VOLTAGE", "CURRENT")
@@ -69,7 +92,7 @@ def test_connect_demo_reports_channels():
 
 def test_per_channel_setpoint_and_measure():
     with _Server() as s:
-        s.call("POST", "/api/connect", {"demo": True})
+        s.connect_itn6332b()
         s.call("POST", "/api/channel/1/setpoint", {"voltage": 24, "current": 12, "priority": "VOLTAGE"})
         s.call("POST", "/api/channel/2/setpoint", {"voltage": 12, "current": 12})
         s.call("POST", "/api/all_output", {"on": True})
@@ -81,7 +104,7 @@ def test_per_channel_setpoint_and_measure():
 
 def test_channels_are_independent():
     with _Server() as s:
-        s.call("POST", "/api/connect", {"demo": True})
+        s.connect_itn6332b()
         s.call("POST", "/api/channel/2/output", {"on": True})
         _, m = s.call("GET", "/api/measure")
         by = {c["number"]: c for c in m["channels"]}
@@ -91,7 +114,7 @@ def test_channels_are_independent():
 
 def test_per_channel_protection():
     with _Server() as s:
-        s.call("POST", "/api/connect", {"demo": True})
+        s.connect_itn6332b()
         assert s.call("POST", "/api/channel/3/protection", {"ovp": 6.0})[0] == 200
         assert s.call("POST", "/api/channel/3/clear_protection", {})[0] == 200
 
@@ -103,21 +126,19 @@ def test_error_when_not_connected():
         assert "connect" in body["error"].lower()
 
 
-def test_cpx200dp_demo_two_channels():
+def test_cpx200dp_two_channels():
     with _Server() as s:
-        status, st = s.call("POST", "/api/connect", {"demo": True, "model": "cpx200dp"})
+        status, st = s.connect_cpx200dp()
         assert status == 200 and st["connected"] is True
         assert st["model"] == "cpx200dp"
-        # CPX200DP always has exactly 2 channels.
         assert [c["number"] for c in st["channels"]] == [1, 2]
-        # Source-only: current min must be 0 (not negative).
         for ch in st["channels"]:
             assert ch["ranges"].get("i_min", 0) == 0.0
 
 
 def test_cpx200dp_multichannel_setpoint():
     with _Server() as s:
-        s.call("POST", "/api/connect", {"demo": True, "model": "cpx200dp"})
+        s.connect_cpx200dp()
         s.call("POST", "/api/channel/1/setpoint", {"voltage": 12.0, "current": 3.5})
         s.call("POST", "/api/channel/2/setpoint", {"voltage": 6.0, "current": 3.5})
         s.call("POST", "/api/all_output", {"on": True})

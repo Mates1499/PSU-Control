@@ -146,7 +146,7 @@ class MockInstrument:
             return "1"
         if up == "*TST?":
             return "0"
-        if up == "SYSTEM:ERROR?":
+        if up in ("SYSTEM:ERROR?", "SYST:ERR?"):
             return '+0,"No error"'
         if up == "SYSTEM:VERSION?":
             return "1.0"
@@ -162,13 +162,15 @@ class MockInstrument:
         base_head = head_u[:-1] if is_query else head_u
 
         # --- channel selection / availability ---
-        if head_u in ("CHANNEL", "CHAN", "INSTRUMENT:SELECT", "INSTRUMENT", "INST:SEL", "INST") and value:
+        if head_u in ("CHANNEL", "CHAN", "INSTRUMENT:SELECT", "INSTRUMENT", "INST:SEL", "INST",
+                      "INST:NSEL") and value:
             try:
                 self.selected = int(value)
             except ValueError:
                 pass
             return None
-        if up in ("CHANNEL?", "CHAN?", "INSTRUMENT:SELECT?", "INSTRUMENT?", "INST:SEL?", "INST?"):
+        if up in ("CHANNEL?", "CHAN?", "INSTRUMENT:SELECT?", "INSTRUMENT?", "INST:SEL?", "INST?",
+                  "INST:NSEL?"):
             return str(self.selected)
         if base_head in ("CHANNEL:STATE", "CHAN:STAT") and is_query:
             try:
@@ -240,11 +242,11 @@ class MockInstrument:
             return "1" if s["output"] else "0"
         if up == "STATUS:QUESTIONABLE:CONDITION?":
             return str(s["ques"])
-        if up in ("MEASURE:SCALAR:VOLTAGE:DC?", "MEAS:VOLT:DC?", "MEASURE:VOLTAGE?"):
+        if up in ("MEASURE:SCALAR:VOLTAGE:DC?", "MEAS:VOLT:DC?", "MEASURE:VOLTAGE?", "MEAS:VOLT?"):
             return f"{self._measure(s)[0]:.4f}"
-        if up in ("MEASURE:SCALAR:CURRENT:DC?", "MEAS:CURR:DC?", "MEASURE:CURRENT?"):
+        if up in ("MEASURE:SCALAR:CURRENT:DC?", "MEAS:CURR:DC?", "MEASURE:CURRENT?", "MEAS:CURR?"):
             return f"{self._measure(s)[1]:.4f}"
-        if up in ("MEASURE:SCALAR:POWER:DC?", "MEAS:POW:DC?", "MEASURE:POWER?"):
+        if up in ("MEASURE:SCALAR:POWER:DC?", "MEAS:POW:DC?", "MEASURE:POWER?", "MEAS:POW?"):
             v, i = self._measure(s)
             return f"{v * i:.4f}"
         if up.startswith("FETCH"):

@@ -7,10 +7,8 @@ lock so concurrent browser requests are serialised onto it.
 
 Supported models (passed as ``model`` in the ``/api/connect`` body):
 
-* ``"itn6332b"`` (default) -- ITECH IT-N6332B; channels discovered via
-  ``CHANnel:STATe?``; built-in simulator uses :class:`MockInstrument`.
-* ``"cpx200dp"``            -- Aim-TTi CPX200DP; always channels 1 and 2;
-  built-in simulator uses :class:`CPX200DPSimulator`.
+* ``"itn6332b"`` (default) -- ITECH IT-N6332B (3-channel, bidirectional)
+* ``"cpx200dp"``            -- Aim-TTi CPX200DP (2-channel, source-only)
 
 JSON API
 --------
@@ -18,7 +16,7 @@ JSON API
 
     GET  /api/state                          -> connection + every channel
     GET  /api/measure                        -> per-channel V/I/P + output
-    POST /api/connect                        {host, port, visa, demo, model?}
+    POST /api/connect                        {host, port, visa, model?}
     POST /api/disconnect
     POST /api/reset
     POST /api/all_output                     {on: bool}
@@ -41,7 +39,6 @@ from ..exceptions import PSUError
 from ..it_n6332b import ITN6332B
 from ..cpx200dp import CPX200DP
 from ..scpi import DEFAULT_SCPI_PORT
-from ..simulator import SimulatedInstrument, CPX200DPSimulator
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _CONTENT_TYPES = {
@@ -51,10 +48,10 @@ _CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
-# Registry: model name -> (DriverClass, SimulatorClass, default_tcp_port)
+# Registry: model name -> (DriverClass, default_tcp_port)
 _MODELS: dict[str, tuple] = {
-    "itn6332b": (ITN6332B, SimulatedInstrument, DEFAULT_SCPI_PORT),
-    "cpx200dp":  (CPX200DP,  CPX200DPSimulator,  CPX200DP.DEFAULT_TCP_PORT),
+    "itn6332b": (ITN6332B, DEFAULT_SCPI_PORT),
+    "cpx200dp":  (CPX200DP,  CPX200DP.DEFAULT_TCP_PORT),
 }
 
 
@@ -64,7 +61,6 @@ class Controller:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._psu: Optional[BasePSUDriver] = None
-        self._sim = None
         self._idn: str = ""
         self._target: str = ""
         self._model: str = ""
@@ -79,7 +75,6 @@ class Controller:
         host: str = "",
         port: int = 0,
         visa: str = "",
-        demo: bool = False,
         model: str = "itn6332b",
     ) -> dict[str, Any]:
         model_key = model.lower().replace("-", "").replace("_", "")
@@ -87,25 +82,18 @@ class Controller:
             raise PSUError(
                 f"Unknown model {model!r}. Choose from: {list(_MODELS)}"
             )
-        DriverClass, SimClass, default_port = _MODELS[model_key]
+        DriverClass, default_port = _MODELS[model_key]
 
         with self._lock:
             self._teardown()
             self._model = model_key
-            if demo:
-                self._sim = SimClass().start()
-                # Noise only on IT-N6332B simulator (MockInstrument)
-                if hasattr(self._sim, "noise"):
-                    self._sim.noise = True
-                self._psu = DriverClass.open_tcp(self._sim.host, self._sim.port)
-                self._target = f"demo ({model_key} simulator)"
-            elif visa:
+            if visa:
                 self._psu = DriverClass.open_visa(visa)
                 self._target = visa
             else:
                 if not host:
                     raise PSUError(
-                        "A host (or VISA resource, or demo mode) is required"
+                        "Provide a host IP address or a VISA resource string."
                     )
                 self._psu = DriverClass.open_tcp(host, port or default_port)
                 self._target = f"{host}:{port or default_port}"
@@ -129,14 +117,12 @@ class Controller:
         return {"connected": False}
 
     def _teardown(self) -> None:
-        for obj in (self._psu, self._sim):
-            try:
-                if obj is not None:
-                    obj.close()
-            except Exception:
-                pass
+        try:
+            if self._psu is not None:
+                self._psu.close()
+        except Exception:
+            pass
         self._psu = None
-        self._sim = None
         self._idn = ""
         self._target = ""
         self._model = ""
@@ -174,7 +160,6 @@ class Controller:
                 "target": self._target,
                 "idn": self._idn,
                 "model": self._model,
-                "demo": self._sim is not None,
                 "channels": [self._channel_state(n) for n in self._channels],
             }
 
@@ -324,7 +309,6 @@ class _Handler(BaseHTTPRequestHandler):
                     host=str(d.get("host", "")).strip(),
                     port=int(d.get("port") or 0),
                     visa=str(d.get("visa", "")).strip(),
-                    demo=bool(d.get("demo", False)),
                     model=str(d.get("model", "itn6332b")),
                 ))
             elif method == "POST" and path == "/api/disconnect":
@@ -407,23 +391,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--model",
         default="itn6332b",
         choices=list(_MODELS),
-        help="PSU model to use in demo mode (default: itn6332b)",
-    )
-    p.add_argument(
-        "--demo",
-        action="store_true",
-        help="Auto-connect to the built-in simulator on startup.",
+        help="PSU model (default: itn6332b)",
     )
     args = p.parse_args(argv)
 
     srv = create_server(args.host, args.port)
-    ctrl: Controller = srv.RequestHandlerClass.controller  # type: ignore[attr-defined]
-    if args.demo:
-        try:
-            ctrl.connect(demo=True, model=args.model)
-            print(f"Demo mode: connected to built-in {args.model} simulator.")
-        except PSUError as exc:
-            print(f"Demo connect failed: {exc}")
 
     print(f"PSU Control web UI serving at http://{args.host}:{args.port}/")
     print("Press Ctrl+C to stop.")

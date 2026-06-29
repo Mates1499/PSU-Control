@@ -11,8 +11,8 @@
     <div class="brand">
       <span class="logo">⎓</span>
       <div>
-        <h1 id="modelLabel">PSU Control</h1>
-        <p class="subtitle" id="modelSub">Programmable DC Power Supply · SCPI</p>
+        <h1 id="modelLabel">IT-N6332B</h1>
+        <p class="subtitle" id="modelSub">ITECH Programmable DC Power Supply · SCPI</p>
       </div>
     </div>
     <div class="conn-status">
@@ -27,8 +27,8 @@
       <div class="row">
         <label>Model
           <select id="model">
-            <option value="itn6332b">ITECH IT-N6332B (bidirectional)</option>
-            <option value="cpx200dp">Aim-TTi CPX200DP (dual-output)</option>
+            <option value="itn6332b">ITECH IT-N6332B (3-channel, bidirectional)</option>
+            <option value="cpx200dp">Aim-TTi CPX200DP (2-channel, source-only)</option>
           </select>
         </label>
         <label>Host / IP<input type="text" id="host" placeholder="192.168.1.50" value="192.168.1.50" /></label>
@@ -37,7 +37,6 @@
       </div>
       <div class="row btn-row">
         <button class="btn primary" id="btnConnect">Connect</button>
-        <button class="btn" id="btnDemo">Demo (simulator)</button>
         <button class="btn danger" id="btnDisconnect" disabled>Disconnect</button>
         <span class="idn" id="idn"></span>
       </div>

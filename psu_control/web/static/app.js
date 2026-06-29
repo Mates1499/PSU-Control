@@ -24,13 +24,12 @@ function toast(msg, isError) {
   toast._t = setTimeout(() => (t.className = "toast"), 3200);
 }
 
-async function connect(demo) {
+async function connect() {
   try {
     const model = $("model").value;
-    const body = demo ? { demo: true, model }
-      : { host: $("host").value, port: parseInt($("port").value, 10) || 0, visa: $("visa").value, model };
+    const body = { host: $("host").value, port: parseInt($("port").value, 10) || 0, visa: $("visa").value, model };
     onConnected(await api("/api/connect", body));
-    toast(demo ? "Connected to simulator" : "Connected");
+    toast("Connected");
   } catch (e) { toast(e.message, true); }
 }
 
@@ -41,17 +40,16 @@ async function disconnect() {
 }
 
 const _MODEL_LABELS = {
-  "itn6332b": { title: "IT-N6332B", sub: "Bidirectional Programmable DC Power Supply · SCPI" },
-  "cpx200dp":  { title: "CPX200DP",  sub: "Dual-Output Programmable DC Power Supply · Aim-TTi" },
+  "itn6332b": { title: "IT-N6332B", sub: "ITECH Bidirectional DC Power Supply · SCPI" },
+  "cpx200dp":  { title: "CPX200DP",  sub: "Aim-TTi Dual-Output DC Power Supply" },
 };
 
 function onConnected(st) {
   connected = true;
   $("connDot").classList.add("on");
-  $("connLabel").textContent = st.demo ? "Connected (demo)" : "Connected";
+  $("connLabel").textContent = "Connected";
   $("idn").textContent = st.idn || "";
   $("btnConnect").disabled = true;
-  $("btnDemo").disabled = true;
   $("btnDisconnect").disabled = false;
   ["btnAllOn", "btnAllOff", "btnReset"].forEach((id) => ($(id).disabled = false));
   const lbl = _MODEL_LABELS[st.model] || { title: "PSU Control", sub: "Programmable DC Power Supply · SCPI" };
@@ -69,7 +67,6 @@ function onDisconnected() {
   $("connLabel").textContent = "Disconnected";
   $("idn").textContent = "";
   $("btnConnect").disabled = false;
-  $("btnDemo").disabled = false;
   $("btnDisconnect").disabled = true;
   ["btnAllOn", "btnAllOff", "btnReset"].forEach((id) => ($(id).disabled = true));
   $("channels").innerHTML = "";
@@ -209,7 +206,6 @@ function drawChart(c, history) {
   ctx.strokeStyle = "#2a323d"; ctx.lineWidth = 1;
   for (let g = 0; g <= 2; g++) { const y = pad + (H - 2 * pad) * g / 2; ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke(); }
   if (history.length < 2) return;
-  // Symmetric scaling so negative (sink) values render below the midline.
   const vMax = Math.max(1, ...history.map((p) => Math.abs(p.v)));
   const iMax = Math.max(0.1, ...history.map((p) => Math.abs(p.i)));
   const plot = (key, max, color) => {
@@ -225,8 +221,7 @@ function drawChart(c, history) {
   plot("i", iMax, "#f59e0b");
 }
 
-$("btnConnect").onclick = () => connect(false);
-$("btnDemo").onclick = () => connect(true);
+$("btnConnect").onclick = connect;
 $("btnDisconnect").onclick = disconnect;
 $("btnAllOn").onclick = () => allOutput(true);
 $("btnAllOff").onclick = () => allOutput(false);

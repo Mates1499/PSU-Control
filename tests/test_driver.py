@@ -31,9 +31,9 @@ def test_idn():
 def test_selects_channel_on_open():
     with MockInstrument() as mock:
         psu = _open(mock)
-        psu.idn()  # round-trip flush so the async CHANnel write is recorded
+        psu.idn()  # round-trip flush so the async INST:NSEL write is recorded
         assert psu.selected_channel == 1
-        assert any(c.upper().startswith("CHAN") for c in mock.received)
+        assert any("INST:NSEL" in c.upper() for c in mock.received)
         psu.close()
 
 
@@ -42,7 +42,7 @@ def test_voltage_roundtrip():
         psu = _open(mock)
         psu.set_voltage(12.5)
         assert abs(psu.get_voltage() - 12.5) < 1e-3
-        assert "SOURce:VOLTage:LEVel:IMMediate:AMPLitude 12.5" in mock.received
+        assert any("VOLT 12.5" in c for c in mock.received)
         psu.close()
 
 
@@ -137,9 +137,9 @@ def test_multichannel_independent_control():
 
 
 def test_channel_proxy_selection_and_availability():
-    with MockInstrument(channels=2) as mock:
+    with MockInstrument(channels=3) as mock:  # IT-N6332B always has 3 channels
         psu = _open(mock)
-        assert psu.available_channels() == [1, 2]      # only 2 present
+        assert psu.available_channels() == [1, 2, 3]
         assert psu.channel(2).available is True
         assert psu.channel(1).output_enabled is False
         psu.channel(2).output_on()
