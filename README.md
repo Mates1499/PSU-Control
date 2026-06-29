@@ -77,6 +77,40 @@ psu.set_power_limits(positive=200.0, negative=100.0)
 i = psu.measure_current()           # negative value means the supply is sinking
 ```
 
+## Web UI
+
+A complete browser dashboard ships in `psu_control.web` — a dependency-free
+server (Python stdlib only) that wraps the driver and serves a single-page
+control panel with live readouts and a chart.
+
+```bash
+# Try it with no hardware — built-in simulator:
+python -m psu_control.web --demo
+# Then open http://127.0.0.1:8080 and click "Demo (simulator)" if not already connected.
+
+# For a real instrument, just start the server and connect from the UI:
+python -m psu_control.web --port 8080 --host 0.0.0.0
+```
+
+The dashboard provides:
+
+- **Connection panel** — connect by host/port (raw TCP) or VISA resource, plus a
+  one-click **Demo** mode backed by the in-process simulator.
+- **Live measurements** — V / I / P meters polled at ~2 Hz with a real-time
+  dual-trace (voltage + current) canvas chart.
+- **Output control** — a large ON/OFF toggle that reflects the instrument state.
+- **Setpoints** — CV/CC mode, voltage and symmetric current limit, applied in one click.
+- **Protection** — set OVP / OCP / OPP, view decoded trip status, clear a latched
+  trip, and send `*RST`.
+
+It is a thin REST layer over the same driver — the JSON API
+(`/api/state`, `/api/measure`, `/api/connect`, `/api/output`, `/api/setpoint`,
+`/api/protection`, `/api/clear_protection`, `/api/reset`) is documented in
+`psu_control/web/server.py` and is easy to script against directly.
+
+> The server binds to `127.0.0.1` by default. Use `--host 0.0.0.0` to expose it
+> on your LAN; it has no authentication, so only do that on a trusted network.
+
 ## Command-line interface
 
 ```bash
@@ -119,13 +153,17 @@ psu_control/
     it_n6332b.py       # ITN6332B high-level driver
     scpi.py            # transport layer (PyVISA + raw TCP backends)
     exceptions.py      # exception hierarchy
+    simulator.py       # in-process SCPI simulator (tests + web demo)
     cli.py             # `python -m psu_control.cli`
+    web/
+        server.py      # stdlib HTTP backend + JSON API (`python -m psu_control.web`)
+        static/        # index.html, style.css, app.js dashboard
 examples/
     basic_usage.py
     data_logging.py
 tests/
-    mock_instrument.py # in-process SCPI mock of an IT-N6332B
-    test_driver.py     # driver tests (no hardware needed)
+    mock_instrument.py # shim re-exporting psu_control.simulator
+    test_driver.py     # driver + web API tests (no hardware needed)
 ```
 
 ## Testing without hardware

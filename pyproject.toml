@@ -19,6 +19,10 @@ test = ["pytest>=7.0"]
 
 [project.scripts]
 psu-control = "psu_control.cli:main"
+psu-control-web = "psu_control.web.server:main"
 
 [tool.setuptools]
-packages = ["psu_control"]
+packages = ["psu_control", "psu_control.web"]
+
+[tool.setuptools.package-data]
+"psu_control.web" = ["static/*.html", "static/*.css", "static/*.js"]
