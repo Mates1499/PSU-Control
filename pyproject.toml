@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psu-control"
+version = "1.0.0"
+description = "SCPI control library for the ITECH IT-N6332B bidirectional DC power supply"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["ITECH", "IT-N6332B", "IT-N6300", "SCPI", "power supply", "instrument", "VISA"]
+dependencies = []
+
+[project.optional-dependencies]
+visa = ["pyvisa>=1.13", "pyvisa-py>=0.7"]
+usb = ["pyvisa>=1.13", "pyvisa-py>=0.7", "pyusb>=1.2"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+psu-control = "psu_control.cli:main"
+
+[tool.setuptools]
+packages = ["psu_control"]
