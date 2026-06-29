@@ -1,11 +1,11 @@
-# Core dependency: VISA backend for instrument communication.
-# pyvisa-py provides a pure-Python backend (USB/TCP/serial) so no NI-VISA
-# install is strictly required, though NI-VISA / Keysight IO Libraries also work.
+# The raw TCP socket backend, the CLI and the web UI need NO third-party
+# packages -- they are pure standard library. The dependencies below are only
+# required if you connect via a VISA resource string (USB-TMC / GPIB / serial).
+#
+# VISA backend for instrument communication. pyvisa-py is a pure-Python backend
+# (USB/TCP/serial); NI-VISA / Keysight IO Libraries also work as backends.
 pyvisa>=1.13
 pyvisa-py>=0.7
 
-# Optional extras used by some transports / examples:
-#   pyusb + libusb       -> USB-TMC support via pyvisa-py
-#   zeroconf             -> mDNS instrument discovery via pyvisa-py
-#   psutil               -> faster TCPIP discovery via pyvisa-py
-pyusb>=1.2; extra == "usb"
+# Uncomment for USB-TMC support via pyvisa-py (also needs a libusb backend):
+# pyusb>=1.2

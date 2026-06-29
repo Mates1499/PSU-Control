@@ -1,110 +1,233 @@
-"""High-level driver for the ITECH IT-N6332B bidirectional DC power supply.
+"""High-level driver for the ITECH IT-N6332B triple-channel DC power supply.
 
-The IT-N6332B is a two-quadrant (source + sink) programmable DC supply from
-ITECH's IT-N6300 series. It is SCPI-controllable over LAN, USB-TMC and GPIB.
-Because it is bidirectional, current and power limits are defined separately
-for the *positive* (sourcing) and *negative* (sinking) directions.
+The IT-N6332B belongs to ITECH's IT-N6300 / IT6300 family of **triple-channel**
+programmable DC power supplies (model line IT6322/IT6332/IT6333). It is *not* a
+bidirectional supply -- it has three independent, isolated source-only output
+channels that can also be combined in series/parallel tracking:
 
-This driver wraps :class:`~psu_control.scpi.ScpiConnection` and exposes an
-ergonomic, fully type-hinted Python API for every common operation: output
-control, CV/CC priority modes, voltage/current/power setpoints, slew rates,
-the full protection suite (OVP/OCP/OPP and over-temperature read-back),
-measurements, status polling, and saved-state recall.
+================  ==============  =============  ===========
+Channel           Voltage         Current        Power
+================  ==============  =============  ===========
+CH1               0 - 30 V        0 - 6 A        180 W
+CH2               0 - 30 V        0 - 6 A        180 W
+CH3               0 - 5 V         0 - 3 A        15 W
+================  ==============  =============  ===========
 
-SCPI mnemonics follow the IT-N6300 series programming reference. Where a model
-or firmware revision uses a slightly different mnemonic, the raw
-:meth:`~psu_control.scpi.ScpiConnection.write` / ``query`` methods on
-``psu.scpi`` remain available as an escape hatch.
+Setpoint resolution is 1 mV / 1 mA. The unit is remote-controllable over LAN,
+USB-TMC, GPIB and RS-232 using SCPI.
+
+The SCPI model is channel-oriented: you select the active channel with
+``INSTrument:NSELect`` / ``INSTrument:SELect`` and then issue per-channel
+``VOLTage`` / ``CURRent`` / ``OUTPut`` / ``MEASure`` commands. This driver hides
+that handshake behind a :class:`Channel` object, so you write::
+
+    with ITN6332B.open_tcp("192.168.1.50") as psu:
+        psu.ch1.apply(12.0, 2.0)     # 12 V, 2 A limit on channel 1
+        psu.ch1.output_on()
+        print(psu.ch1.measure())     # 12.00 V, 0.50 A, 6.0 W
+
+Command mnemonics follow the IT6300 series Programming Guide (which documents
+the IT6322/IT6332/IT6333 A/B/C models). If a firmware revision differs, the raw
+connection remains available via ``psu.scpi.write`` / ``psu.scpi.query``.
 """
 
 from __future__ import annotations
 
-import enum
 import time
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Optional
 
 from .exceptions import PSUCommandError, PSUProtectionTripped
 from .scpi import DEFAULT_SCPI_PORT, DEFAULT_TIMEOUT_S, ScpiConnection
 
 
-class OutputMode(enum.Enum):
-    """Source priority / regulation mode of the supply.
+@dataclass(frozen=True)
+class ChannelSpec:
+    """Static ratings of one output channel, used for range validation."""
 
-    * ``VOLTAGE`` -- constant-voltage priority (the default for a PSU).
-    * ``CURRENT`` -- constant-current priority.
-    """
+    number: int       # 1-based channel index used by INSTrument:NSELect
+    name: str         # SCPI channel name, e.g. "CH1"
+    max_voltage: float
+    max_current: float
+    max_power: float
 
-    VOLTAGE = "VOLT"
-    CURRENT = "CURR"
+
+# Factory ratings of the IT-N6332B (see module docstring).
+IT_N6332B_CHANNELS = (
+    ChannelSpec(1, "CH1", 30.0, 6.0, 180.0),
+    ChannelSpec(2, "CH2", 30.0, 6.0, 180.0),
+    ChannelSpec(3, "CH3", 5.0, 3.0, 15.0),
+)
 
 
 @dataclass(frozen=True)
 class Measurement:
-    """A simultaneous snapshot of the output, as returned by :meth:`measure_all`."""
+    """A measured snapshot of one channel's output."""
 
     voltage: float  # Volts
-    current: float  # Amps (positive = sourcing, negative = sinking)
+    current: float  # Amps
     power: float    # Watts
 
     def __str__(self) -> str:
-        return f"{self.voltage:.4f} V, {self.current:.4f} A, {self.power:.4f} W"
+        return f"{self.voltage:.3f} V, {self.current:.3f} A, {self.power:.3f} W"
 
 
-@dataclass(frozen=True)
-class ProtectionStatus:
-    """Decoded protection / fault flags from the questionable status register."""
+class Channel:
+    """One output channel of the supply.
 
-    ovp: bool   # over-voltage protection tripped
-    ocp: bool   # over-current protection tripped
-    opp: bool   # over-power protection tripped
-    otp: bool   # over-temperature protection tripped
-    raw: int    # raw questionable-status register value
+    Obtained via ``psu.ch1`` / ``psu.ch2`` / ``psu.ch3`` or ``psu.channel(n)``.
+    Every method transparently selects this channel on the instrument before
+    issuing its command, so callers never deal with ``INSTrument`` directly.
+    """
+
+    def __init__(self, psu: "ITN6332B", spec: ChannelSpec):
+        self._psu = psu
+        self.spec = spec
+
+    # -- selection --------------------------------------------------------
+
+    def select(self) -> None:
+        """Make this the active channel for subsequent raw SCPI commands."""
+        self._psu._select(self.spec.number)
+
+    # -- setpoints --------------------------------------------------------
+
+    def set_voltage(self, volts: float) -> None:
+        """Set this channel's output voltage (V)."""
+        self._check("voltage", volts, self.spec.max_voltage)
+        self.select()
+        self._psu.scpi.write(f"VOLTage {volts}")
+
+    def get_voltage(self) -> float:
+        """Return this channel's programmed voltage setpoint (V)."""
+        self.select()
+        return float(self._psu.scpi.query("VOLTage?"))
+
+    def set_current(self, amps: float) -> None:
+        """Set this channel's current limit (A)."""
+        self._check("current", amps, self.spec.max_current)
+        self.select()
+        self._psu.scpi.write(f"CURRent {amps}")
+
+    def get_current(self) -> float:
+        """Return this channel's programmed current limit (A)."""
+        self.select()
+        return float(self._psu.scpi.query("CURRent?"))
+
+    def set_voltage_limit(self, volts: float) -> None:
+        """Set the soft maximum-voltage limit for this channel (V)."""
+        self.select()
+        self._psu.scpi.write(f"VOLTage:LIMit {volts}")
+
+    def apply(self, voltage: float, current: float) -> None:
+        """Set voltage and current limit together (``APPLy <v>,<a>``)."""
+        self._check("voltage", voltage, self.spec.max_voltage)
+        self._check("current", current, self.spec.max_current)
+        self.select()
+        self._psu.scpi.write(f"APPLy {voltage},{current}")
+
+    # -- output -----------------------------------------------------------
+
+    def output_on(self) -> None:
+        """Enable this channel's output."""
+        self.select()
+        self._psu.scpi.write("OUTPut:STATe ON")
+
+    def output_off(self) -> None:
+        """Disable this channel's output."""
+        self.select()
+        self._psu.scpi.write("OUTPut:STATe OFF")
+
+    def set_output(self, enabled: bool) -> None:
+        self.select()
+        self._psu.scpi.write(f"OUTPut:STATe {'ON' if enabled else 'OFF'}")
 
     @property
-    def any_tripped(self) -> bool:
-        return self.ovp or self.ocp or self.opp or self.otp
+    def output_enabled(self) -> bool:
+        """Whether this channel's output is currently enabled."""
+        self.select()
+        return self._psu.scpi.query("OUTPut:STATe?").strip() in ("1", "ON")
 
-    def __str__(self) -> str:
-        if not self.any_tripped:
-            return "OK (no protection tripped)"
-        tripped = [
-            name
-            for name, flag in (
-                ("OVP", self.ovp),
-                ("OCP", self.ocp),
-                ("OPP", self.opp),
-                ("OTP", self.otp),
+    # -- protection -------------------------------------------------------
+
+    def set_ovp(self, volts: float, *, enable: bool = True) -> None:
+        """Configure over-voltage protection (OVP) for this channel (V)."""
+        self.select()
+        self._psu.scpi.write(f"VOLTage:PROTection:LEVel {volts}")
+        self._psu.scpi.write(
+            f"VOLTage:PROTection:STATe {'ON' if enable else 'OFF'}"
+        )
+
+    # -- measurements -----------------------------------------------------
+
+    def measure_voltage(self) -> float:
+        """Measure the actual output voltage of this channel (V)."""
+        self.select()
+        return float(self._psu.scpi.query("MEASure:VOLTage:DC?"))
+
+    def measure_current(self) -> float:
+        """Measure the actual output current of this channel (A)."""
+        self.select()
+        return float(self._psu.scpi.query("MEASure:CURRent:DC?"))
+
+    def measure_power(self) -> float:
+        """Measure the actual output power of this channel (W)."""
+        self.select()
+        return float(self._psu.scpi.query("MEASure:POWer:DC?"))
+
+    def measure(self) -> Measurement:
+        """Return a :class:`Measurement` snapshot (V, I, P) for this channel."""
+        return Measurement(
+            voltage=self.measure_voltage(),
+            current=self.measure_current(),
+            power=self.measure_power(),
+        )
+
+    def regulation_mode(self) -> str:
+        """Best-effort CV/CC indication from the live measurement.
+
+        The IT6300 family does not expose a simple per-channel CV/CC query, so
+        this compares measured current against the programmed limit: at/above
+        the limit means the channel has dropped into constant-current.
+        """
+        i = self.measure_current()
+        limit = self.get_current()
+        return "CC" if limit > 0 and i >= limit * 0.98 else "CV"
+
+    # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _check(kind: str, value: float, maximum: float) -> None:
+        if value < 0 or value > maximum:
+            raise ValueError(
+                f"{kind} {value} out of range for this channel (0..{maximum})"
             )
-            if flag
-        ]
-        return "TRIPPED: " + ", ".join(tripped)
 
-
-# Bit masks in the SCPI Questionable Status register used by ITECH supplies.
-_QUES_OV = 0x0001   # over-voltage
-_QUES_OC = 0x0002   # over-current
-_QUES_OP = 0x0008   # over-power
-_QUES_OT = 0x0010   # over-temperature
+    def __repr__(self) -> str:
+        return f"Channel({self.spec.name}, {self.spec.max_voltage}V/{self.spec.max_current}A)"
 
 
 class ITN6332B:
-    """Driver for an ITECH IT-N6332B power supply.
+    """Driver for an ITECH IT-N6332B triple-channel power supply.
 
-    Construct via the :meth:`open_tcp`, :meth:`open_visa` or :meth:`open_usb`
-    classmethods, or wrap an existing :class:`ScpiConnection`::
+    Open via :meth:`open_tcp`, :meth:`open_visa` or :meth:`open_usb`, then use
+    the per-channel objects :attr:`ch1`, :attr:`ch2`, :attr:`ch3`::
 
         with ITN6332B.open_tcp("192.168.1.50") as psu:
-            psu.set_voltage(12.0)
-            psu.output_on()
+            psu.ch1.apply(12.0, 2.0)
+            psu.ch1.output_on()
     """
+
+    #: Tracking modes for combining CH1 + CH2 (``set_tracking``).
+    TRACK_OFF = "OFF"
+    TRACK_SERIES = "SERies"
+    TRACK_PARALLEL = "PARallel"
 
     def __init__(self, connection: ScpiConnection, *, claim_remote: bool = True):
         self.scpi = connection
+        self._selected: Optional[int] = None
+        self.channels = tuple(Channel(self, spec) for spec in IT_N6332B_CHANNELS)
         if claim_remote:
-            # Put the instrument under remote control so the front panel is
-            # locked out and commands are accepted. Ignored by models that
-            # don't implement it.
             try:
                 self.scpi.write("SYSTem:REMote")
             except Exception:
@@ -152,23 +275,51 @@ class ITN6332B:
         serial: Optional[str] = None,
         *,
         vendor_id: int = 0x2EC7,  # ITECH USB vendor ID
-        product_id: int = 0x6300,  # IT-N6300 series product ID
+        product_id: Optional[int] = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         claim_remote: bool = True,
     ) -> "ITN6332B":
         """Open over USB-TMC via PyVISA.
 
-        If ``serial`` is omitted, a wildcard VISA pattern is used and the first
-        matching instrument is opened.
+        If ``serial``/``product_id`` are omitted, wildcards are used and the
+        first matching ITECH instrument is opened.
         """
+        pid = f"0x{product_id:04X}" if product_id is not None else "?*"
         serial_part = serial if serial is not None else "?*"
-        resource = (
-            f"USB::0x{vendor_id:04X}::0x{product_id:04X}::{serial_part}::INSTR"
-        )
+        resource = f"USB::0x{vendor_id:04X}::{pid}::{serial_part}::INSTR"
         return cls(
             ScpiConnection.from_visa(resource, timeout=timeout),
             claim_remote=claim_remote,
         )
+
+    # ------------------------------------------------------------------ #
+    # Channel access
+    # ------------------------------------------------------------------ #
+
+    @property
+    def ch1(self) -> Channel:
+        return self.channels[0]
+
+    @property
+    def ch2(self) -> Channel:
+        return self.channels[1]
+
+    @property
+    def ch3(self) -> Channel:
+        return self.channels[2]
+
+    def channel(self, number: int) -> Channel:
+        """Return the channel with the given 1-based number."""
+        for ch in self.channels:
+            if ch.spec.number == number:
+                return ch
+        raise ValueError(f"No such channel: {number}")
+
+    def _select(self, number: int) -> None:
+        """Select the active channel, skipping the write if already selected."""
+        if self._selected != number:
+            self.scpi.write(f"INSTrument:NSELect {number}")
+            self._selected = number
 
     # ------------------------------------------------------------------ #
     # Identification & housekeeping
@@ -181,6 +332,7 @@ class ITN6332B:
     def reset(self) -> None:
         """Reset the instrument to its power-on configuration (``*RST``)."""
         self.scpi.write("*RST")
+        self._selected = None
         self.wait_complete()
 
     def clear_status(self) -> None:
@@ -211,7 +363,7 @@ class ITN6332B:
 
     def beep(self) -> None:
         """Emit a beep from the instrument."""
-        self.scpi.write("SYSTem:BEEPer:IMMediate")
+        self.scpi.write("SYSTem:BEEPer")
 
     # ------------------------------------------------------------------ #
     # Error queue
@@ -234,8 +386,8 @@ class ITN6332B:
         """Drain the error queue and raise :class:`PSUCommandError` on any error."""
         code, msg = self.next_error()
         if code != 0:
-            # Drain remaining entries so the queue is clean for next time.
             first = (code, msg)
+            # Drain the rest so the queue is clean for next time.
             while True:
                 nxt_code, _ = self.next_error()
                 if nxt_code == 0:
@@ -243,194 +395,35 @@ class ITN6332B:
             raise PSUCommandError(first[0], first[1])
 
     # ------------------------------------------------------------------ #
-    # Output control
+    # Multi-channel convenience
     # ------------------------------------------------------------------ #
 
-    def output_on(self) -> None:
-        """Enable the output."""
-        self.scpi.write("OUTPut:STATe ON")
+    def all_output_on(self) -> None:
+        """Enable the output on every channel."""
+        for ch in self.channels:
+            ch.output_on()
 
-    def output_off(self) -> None:
-        """Disable the output."""
-        self.scpi.write("OUTPut:STATe OFF")
+    def all_output_off(self) -> None:
+        """Disable the output on every channel."""
+        for ch in self.channels:
+            ch.output_off()
 
-    def set_output(self, enabled: bool) -> None:
-        """Enable or disable the output from a boolean."""
-        self.scpi.write(f"OUTPut:STATe {'ON' if enabled else 'OFF'}")
-
-    @property
-    def output_enabled(self) -> bool:
-        """Whether the output is currently enabled."""
-        return self.scpi.query("OUTPut:STATe?").strip() in ("1", "ON")
-
-    def set_output_delays(
-        self, rise_s: Optional[float] = None, fall_s: Optional[float] = None
-    ) -> None:
-        """Set output on/off sequencing delays in seconds."""
-        if rise_s is not None:
-            self.scpi.write(f"OUTPut:DELay:RISE {rise_s}")
-        if fall_s is not None:
-            self.scpi.write(f"OUTPut:DELay:FALL {fall_s}")
+    def measure_all(self) -> dict[str, Measurement]:
+        """Return ``{channel_name: Measurement}`` for all channels."""
+        return {ch.spec.name: ch.measure() for ch in self.channels}
 
     # ------------------------------------------------------------------ #
-    # Regulation mode
+    # Series / parallel tracking (combines CH1 + CH2)
     # ------------------------------------------------------------------ #
 
-    def set_mode(self, mode: OutputMode) -> None:
-        """Select constant-voltage or constant-current priority mode."""
-        self.scpi.write(f"SOURce:FUNCtion {mode.value}")
+    def set_tracking(self, mode: str) -> None:
+        """Set CH1+CH2 tracking mode.
 
-    def get_mode(self) -> OutputMode:
-        """Return the active priority mode."""
-        resp = self.scpi.query("SOURce:FUNCtion?").strip().upper()
-        return OutputMode.CURRENT if resp.startswith("CURR") else OutputMode.VOLTAGE
-
-    # ------------------------------------------------------------------ #
-    # Voltage
-    # ------------------------------------------------------------------ #
-
-    def set_voltage(self, volts: float) -> None:
-        """Set the output voltage setpoint (V)."""
-        self.scpi.write(f"SOURce:VOLTage:LEVel:IMMediate:AMPLitude {volts}")
-
-    def get_voltage(self) -> float:
-        """Return the programmed voltage setpoint (V)."""
-        return float(self.scpi.query("SOURce:VOLTage:LEVel:IMMediate:AMPLitude?"))
-
-    def set_voltage_slew(self, volts_per_s: float) -> None:
-        """Set the voltage slew (ramp) rate in V/s."""
-        self.scpi.write(f"SOURce:VOLTage:SLEW:IMMediate {volts_per_s}")
-
-    def set_voltage_limits(
-        self, positive: Optional[float] = None, negative: Optional[float] = None
-    ) -> None:
-        """Constrain the programmable voltage range (V)."""
-        if positive is not None:
-            self.scpi.write(f"SOURce:VOLTage:LIMit:POSitive {positive}")
-        if negative is not None:
-            self.scpi.write(f"SOURce:VOLTage:LIMit:NEGative {negative}")
-
-    # ------------------------------------------------------------------ #
-    # Current  (bidirectional: positive = source, negative = sink)
-    # ------------------------------------------------------------------ #
-
-    def set_current_limit(
-        self,
-        amps: Optional[float] = None,
-        *,
-        positive: Optional[float] = None,
-        negative: Optional[float] = None,
-    ) -> None:
-        """Set the current limit(s) in amps.
-
-        Because the IT-N6332B is bidirectional, source (positive) and sink
-        (negative) limits are independent. Passing ``amps`` sets a symmetric
-        limit (``+amps`` sourcing, ``-amps`` sinking). Pass ``positive`` and/or
-        ``negative`` explicitly for an asymmetric configuration.
+        Args:
+            mode: One of :attr:`TRACK_OFF`, :attr:`TRACK_SERIES`,
+                :attr:`TRACK_PARALLEL`.
         """
-        if amps is not None:
-            mag = abs(amps)
-            self.scpi.write(f"SOURce:CURRent:LIMit:POSitive {mag}")
-            self.scpi.write(f"SOURce:CURRent:LIMit:NEGative {-mag}")
-        if positive is not None:
-            self.scpi.write(f"SOURce:CURRent:LIMit:POSitive {abs(positive)}")
-        if negative is not None:
-            self.scpi.write(f"SOURce:CURRent:LIMit:NEGative {-abs(negative)}")
-
-    def set_current(self, amps: float) -> None:
-        """Set the current setpoint used in constant-current priority mode (A)."""
-        self.scpi.write(f"SOURce:CURRent:LEVel:IMMediate:AMPLitude {amps}")
-
-    def get_current_setpoint(self) -> float:
-        """Return the programmed current setpoint (A)."""
-        return float(self.scpi.query("SOURce:CURRent:LEVel:IMMediate:AMPLitude?"))
-
-    def get_current_limits(self) -> tuple[float, float]:
-        """Return the ``(positive, negative)`` current limits in amps."""
-        pos = float(self.scpi.query("SOURce:CURRent:LIMit:POSitive?"))
-        neg = float(self.scpi.query("SOURce:CURRent:LIMit:NEGative?"))
-        return pos, neg
-
-    def set_current_slew(self, amps_per_s: float) -> None:
-        """Set the current slew (ramp) rate in A/s."""
-        self.scpi.write(f"SOURce:CURRent:SLEW:IMMediate {amps_per_s}")
-
-    # ------------------------------------------------------------------ #
-    # Power (bidirectional limits)
-    # ------------------------------------------------------------------ #
-
-    def set_power_limits(
-        self, positive: Optional[float] = None, negative: Optional[float] = None
-    ) -> None:
-        """Set source (positive) and/or sink (negative) power limits in watts."""
-        if positive is not None:
-            self.scpi.write(f"SOURce:POWer:LIMit:POSitive {abs(positive)}")
-        if negative is not None:
-            self.scpi.write(f"SOURce:POWer:LIMit:NEGative {-abs(negative)}")
-
-    # ------------------------------------------------------------------ #
-    # Protections
-    # ------------------------------------------------------------------ #
-
-    def set_ovp(self, volts: float, *, enable: bool = True) -> None:
-        """Configure over-voltage protection (OVP) trip level in volts."""
-        self.scpi.write(f"SOURce:VOLTage:PROTection:LEVel {volts}")
-        self.scpi.write(f"SOURce:VOLTage:PROTection:STATe {'ON' if enable else 'OFF'}")
-
-    def set_ocp(self, amps: float, *, enable: bool = True) -> None:
-        """Configure over-current protection (OCP) trip level in amps."""
-        self.scpi.write(f"SOURce:CURRent:PROTection:LEVel {amps}")
-        self.scpi.write(f"SOURce:CURRent:PROTection:STATe {'ON' if enable else 'OFF'}")
-
-    def set_opp(self, watts: float, *, enable: bool = True) -> None:
-        """Configure over-power protection (OPP) trip level in watts."""
-        self.scpi.write(f"SOURce:POWer:PROTection:LEVel {watts}")
-        self.scpi.write(f"SOURce:POWer:PROTection:STATe {'ON' if enable else 'OFF'}")
-
-    def protection_status(self) -> ProtectionStatus:
-        """Read and decode the questionable-status register into trip flags."""
-        raw = int(self.scpi.query("STATus:QUEStionable:CONDition?"))
-        return ProtectionStatus(
-            ovp=bool(raw & _QUES_OV),
-            ocp=bool(raw & _QUES_OC),
-            opp=bool(raw & _QUES_OP),
-            otp=bool(raw & _QUES_OT),
-            raw=raw,
-        )
-
-    def clear_protection(self) -> None:
-        """Clear any latched protection so the output can be re-enabled."""
-        self.scpi.write("OUTPut:PROTection:CLEar")
-
-    def raise_if_tripped(self) -> None:
-        """Raise :class:`PSUProtectionTripped` if any protection has tripped."""
-        status = self.protection_status()
-        if status.any_tripped:
-            raise PSUProtectionTripped(str(status))
-
-    # ------------------------------------------------------------------ #
-    # Measurements
-    # ------------------------------------------------------------------ #
-
-    def measure_voltage(self) -> float:
-        """Measure the actual output voltage (V)."""
-        return float(self.scpi.query("MEASure:SCALar:VOLTage:DC?"))
-
-    def measure_current(self) -> float:
-        """Measure the actual output current (A); negative when sinking."""
-        return float(self.scpi.query("MEASure:SCALar:CURRent:DC?"))
-
-    def measure_power(self) -> float:
-        """Measure the actual output power (W); negative when sinking."""
-        return float(self.scpi.query("MEASure:SCALar:POWer:DC?"))
-
-    def measure_all(self) -> Measurement:
-        """Return a single :class:`Measurement` snapshot of V, I and P."""
-        return Measurement(
-            voltage=self.measure_voltage(),
-            current=self.measure_current(),
-            power=self.measure_power(),
-        )
+        self.scpi.write(f"OUTPut:TRACk {mode}")
 
     # ------------------------------------------------------------------ #
     # Saved states
@@ -443,71 +436,28 @@ class ITN6332B:
     def recall_state(self, slot: int) -> None:
         """Recall a saved setup from memory ``slot`` (``*RCL``)."""
         self.scpi.write(f"*RCL {int(slot)}")
-
-    # ------------------------------------------------------------------ #
-    # Convenience helpers
-    # ------------------------------------------------------------------ #
-
-    def apply(
-        self,
-        voltage: float,
-        current_limit: float,
-        *,
-        output: bool = True,
-    ) -> None:
-        """Configure a CV setpoint with a symmetric current limit in one call.
-
-        Args:
-            voltage: Output voltage setpoint in volts.
-            current_limit: Symmetric source/sink current limit in amps.
-            output: If ``True`` (default), enable the output afterwards.
-        """
-        self.set_mode(OutputMode.VOLTAGE)
-        self.set_voltage(voltage)
-        self.set_current_limit(current_limit)
-        if output:
-            self.output_on()
-
-    def ramp_voltage(
-        self,
-        target: float,
-        *,
-        step: float = 0.5,
-        interval_s: float = 0.1,
-    ) -> None:
-        """Software-ramp the voltage setpoint from its current value to ``target``.
-
-        Useful for a gentle approach when the hardware slew rate is not used.
-        """
-        start = self.get_voltage()
-        if step <= 0:
-            raise ValueError("step must be positive")
-        n = max(1, int(abs(target - start) / step))
-        for i in range(1, n + 1):
-            self.set_voltage(start + (target - start) * i / n)
-            time.sleep(interval_s)
-        self.set_voltage(target)
-
-    def shutdown(self) -> None:
-        """Safely turn the output off and return the instrument to local control."""
-        try:
-            self.output_off()
-        finally:
-            self.local()
+        self._selected = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
 
+    def shutdown(self) -> None:
+        """Safely turn every output off and return to local control."""
+        try:
+            self.all_output_off()
+        finally:
+            self.local()
+
     def close(self) -> None:
-        """Close the underlying connection (does not change the output state)."""
+        """Close the underlying connection (does not change output state)."""
         self.scpi.close()
 
     def __enter__(self) -> "ITN6332B":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        # On exit, fail safe: turn the output off, release remote, then close.
+        # Fail safe: turn all outputs off, release remote, then close.
         try:
             self.shutdown()
         except Exception:

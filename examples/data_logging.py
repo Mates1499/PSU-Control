@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Log voltage / current / power to a CSV file at a fixed interval."""
+"""Log all three channels' voltage / current / power to a CSV at a fixed rate."""
 
 import csv
 import sys
@@ -11,19 +11,28 @@ from psu_control import ITN6332B
 def log(host: str, duration_s: float, interval_s: float, path: str) -> None:
     with ITN6332B.open_tcp(host) as psu:
         print("Logging from:", psu.idn())
-        psu.output_on()
+        psu.all_output_on()
+
+        names = [ch.spec.name for ch in psu.channels]
+        header = ["t_s"]
+        for n in names:
+            header += [f"{n}_V", f"{n}_A", f"{n}_W"]
 
         with open(path, "w", newline="") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["t_s", "voltage_V", "current_A", "power_W"])
+            writer.writerow(header)
 
             t0 = time.monotonic()
             while True:
                 t = time.monotonic() - t0
-                m = psu.measure_all()
-                writer.writerow([f"{t:.3f}", m.voltage, m.current, m.power])
+                snap = psu.measure_all()
+                row = [f"{t:.3f}"]
+                for n in names:
+                    m = snap[n]
+                    row += [m.voltage, m.current, m.power]
+                writer.writerow(row)
                 fh.flush()
-                print(f"t={t:6.2f}s  {m}")
+                print(f"t={t:6.2f}s  " + "  ".join(f"{n}:{snap[n]}" for n in names))
 
                 if t >= duration_s:
                     break

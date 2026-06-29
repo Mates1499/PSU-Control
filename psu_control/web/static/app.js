@@ -1,16 +1,11 @@
 "use strict";
 
-// ---- tiny DOM helpers ----------------------------------------------------
 const $ = (id) => document.getElementById(id);
-const num = (id) => {
-  const v = $(id).value.trim();
-  return v === "" ? null : parseFloat(v);
-};
 
 let connected = false;
 let pollTimer = null;
-const history = []; // {t, v, i}
-const MAX_POINTS = 120;
+const channels = {}; // number -> { el, history:[], specs }
+const MAX_POINTS = 90;
 
 // ---- API -----------------------------------------------------------------
 async function api(path, body) {
@@ -18,9 +13,7 @@ async function api(path, body) {
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.ok === false) {
-    throw new Error(data.error || `Request failed (${res.status})`);
-  }
+  if (!res.ok || data.ok === false) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
 }
 
@@ -38,32 +31,27 @@ async function connect(demo) {
     const body = demo
       ? { demo: true }
       : { host: $("host").value, port: parseInt($("port").value, 10), visa: $("visa").value };
-    const st = await api("/api/connect", body);
-    onConnected(st);
+    onConnected(await api("/api/connect", body));
     toast(demo ? "Connected to simulator" : "Connected");
-  } catch (e) {
-    toast(e.message, true);
-  }
+  } catch (e) { toast(e.message, true); }
 }
 
 async function disconnect() {
-  try {
-    await api("/api/disconnect", {});
-  } catch (e) { /* ignore */ }
+  try { await api("/api/disconnect", {}); } catch (e) { /* ignore */ }
   onDisconnected();
   toast("Disconnected");
 }
 
 function onConnected(st) {
   connected = true;
-  history.length = 0;
   $("connDot").classList.add("on");
   $("connLabel").textContent = st.demo ? "Connected (demo)" : "Connected";
   $("idn").textContent = st.idn || "";
-  setControlsEnabled(true);
   $("btnConnect").disabled = true;
   $("btnDemo").disabled = true;
   $("btnDisconnect").disabled = false;
+  ["btnAllOn", "btnAllOff", "btnReset", "tracking"].forEach((id) => ($(id).disabled = false));
+  buildChannels(st.channels || []);
   applyState(st);
   startPolling();
 }
@@ -74,25 +62,52 @@ function onDisconnected() {
   $("connDot").classList.remove("on");
   $("connLabel").textContent = "Disconnected";
   $("idn").textContent = "";
-  setControlsEnabled(false);
   $("btnConnect").disabled = false;
   $("btnDemo").disabled = false;
   $("btnDisconnect").disabled = true;
-  $("mVoltage").textContent = $("mCurrent").textContent = $("mPower").textContent = "—";
+  ["btnAllOn", "btnAllOff", "btnReset", "tracking"].forEach((id) => ($(id).disabled = true));
+  $("channels").innerHTML = "";
+  for (const k in channels) delete channels[k];
 }
 
-function setControlsEnabled(on) {
-  ["btnOutput", "btnApply", "btnProt", "btnClearProt", "btnReset"].forEach((id) => {
-    $(id).disabled = !on;
+// ---- build channel cards -------------------------------------------------
+function buildChannels(list) {
+  const host = $("channels");
+  host.innerHTML = "";
+  for (const k in channels) delete channels[k];
+  const tpl = $("channelTemplate");
+
+  list.forEach((c) => {
+    const node = tpl.content.cloneNode(true);
+    const el = node.querySelector(".channel");
+    el.querySelector(".ch-name").textContent = c.name;
+    el.querySelector(".ch-rating").textContent = `0–${c.max_voltage} V · 0–${c.max_current} A · ${c.max_power} W`;
+
+    const sv = el.querySelector(".set-volt");
+    const sc = el.querySelector(".set-curr");
+    sv.max = c.max_voltage; sv.min = 0;
+    sc.max = c.max_current; sc.min = 0;
+    sv.value = (c.voltage_set ?? 0).toFixed(3);
+    sc.value = (c.current_set ?? 0).toFixed(3);
+
+    el.querySelector(".btn-apply").onclick = () => applySetpoint(c.number, sv, sc);
+    el.querySelector(".btn-ovp").onclick = () => applyOvp(c.number, el.querySelector(".set-ovp"));
+    el.querySelector(".btn-output").onclick = () => toggleOutput(c.number);
+
+    host.appendChild(node);
+    channels[c.number] = { el, history: [] };
   });
 }
 
-// ---- state rendering -----------------------------------------------------
+// ---- rendering -----------------------------------------------------------
 function applyState(st) {
   if (!st || !st.connected) return;
-  if (typeof st.voltage_set === "number") $("setVoltage").value = st.voltage_set.toFixed(2);
-  if (typeof st.current_set === "number") $("setCurrent").value = st.current_set.toFixed(2);
-  if (st.mode) $("mode").value = st.mode;
+  (st.channels || []).forEach((c) => {
+    const ch = channels[c.number];
+    if (!ch) return;
+    ch.el.querySelector(".set-volt").value = (c.voltage_set ?? 0).toFixed(3);
+    ch.el.querySelector(".set-curr").value = (c.current_set ?? 0).toFixed(3);
+  });
   renderMeasure(st);
 }
 
@@ -101,71 +116,73 @@ function renderMeasure(st) {
     if (connected) { onDisconnected(); toast("Instrument disconnected", true); }
     return;
   }
-  const m = st.measurement || {};
-  $("mVoltage").textContent = fmt(m.voltage);
-  $("mCurrent").textContent = fmt(m.current);
-  $("mPower").textContent = fmt(m.power);
+  (st.channels || []).forEach((c) => {
+    const ch = channels[c.number];
+    if (!ch) return;
+    const m = c.measurement || {};
+    ch.el.querySelector(".m-volt").textContent = fmt(m.voltage);
+    ch.el.querySelector(".m-curr").textContent = fmt(m.current);
+    ch.el.querySelector(".m-pow").textContent = fmt(m.power);
 
-  setOutputButton(st.output);
-  renderProtection(st.protection);
+    const badge = ch.el.querySelector(".mode-badge");
+    if (c.mode) {
+      badge.textContent = c.output ? c.mode : "—";
+      badge.className = "mode-badge " + (c.output ? c.mode.toLowerCase() : "");
+    }
+    setOutputButton(ch.el.querySelector(".btn-output"), c.output);
 
-  history.push({ v: m.voltage || 0, i: m.current || 0 });
-  while (history.length > MAX_POINTS) history.shift();
-  drawChart();
+    ch.history.push({ v: m.voltage || 0, i: m.current || 0 });
+    while (ch.history.length > MAX_POINTS) ch.history.shift();
+    drawChart(ch.el.querySelector(".chart"), ch.history);
+  });
 }
 
 function fmt(x) { return typeof x === "number" ? x.toFixed(3) : "—"; }
 
-function setOutputButton(on) {
-  const b = $("btnOutput");
-  b.classList.toggle("on", !!on);
-  b.classList.toggle("off", !on);
-  b.querySelector(".state").textContent = on ? "OUTPUT ON" : "OUTPUT OFF";
-}
-
-function renderProtection(p) {
-  const el = $("protStatus");
-  if (!p) { el.textContent = "Protection: —"; return; }
-  el.textContent = "Protection: " + (p.text || (p.any ? "TRIPPED" : "OK"));
-  el.classList.toggle("tripped", !!p.any);
-  el.classList.toggle("ok", !p.any);
+function setOutputButton(btn, on) {
+  btn.classList.toggle("on", !!on);
+  btn.classList.toggle("off", !on);
+  btn.querySelector(".state").textContent = on ? "OUTPUT ON" : "OUTPUT OFF";
 }
 
 // ---- actions -------------------------------------------------------------
-async function toggleOutput() {
-  const turningOn = !$("btnOutput").classList.contains("on");
+async function applySetpoint(n, sv, sc) {
   try {
-    const st = await api("/api/output", { on: turningOn });
-    renderMeasure(st);
+    applyState(await api(`/api/channel/${n}/setpoint`, {
+      voltage: parseFloat(sv.value), current: parseFloat(sc.value),
+    }));
+    toast(`CH${n} setpoints applied`);
   } catch (e) { toast(e.message, true); }
 }
 
-async function applySetpoints() {
+async function applyOvp(n, input) {
+  const v = input.value.trim();
+  if (v === "") { toast("Enter an OVP level first", true); return; }
   try {
-    const st = await api("/api/setpoint", {
-      mode: $("mode").value,
-      voltage: num("setVoltage"),
-      current: num("setCurrent"),
-    });
-    applyState(st);
-    toast("Setpoints applied");
+    await api(`/api/channel/${n}/ovp`, { level: parseFloat(v), enable: true });
+    toast(`CH${n} OVP set to ${v} V`);
   } catch (e) { toast(e.message, true); }
 }
 
-async function applyProtection() {
-  try {
-    await api("/api/protection", { ovp: num("ovp"), ocp: num("ocp"), opp: num("opp") });
-    toast("Protection updated");
-  } catch (e) { toast(e.message, true); }
+async function toggleOutput(n) {
+  const btn = channels[n].el.querySelector(".btn-output");
+  const turningOn = !btn.classList.contains("on");
+  try { renderMeasure(await api(`/api/channel/${n}/output`, { on: turningOn })); }
+  catch (e) { toast(e.message, true); }
 }
 
-async function clearProtection() {
-  try { renderMeasure(await api("/api/clear_protection", {})); toast("Protection cleared"); }
+async function allOutput(on) {
+  try { renderMeasure(await api("/api/all_output", { on })); toast(on ? "All outputs ON" : "All outputs OFF"); }
+  catch (e) { toast(e.message, true); }
+}
+
+async function setTracking(mode) {
+  try { applyState(await api("/api/tracking", { mode })); toast(`Tracking: ${mode}`); }
   catch (e) { toast(e.message, true); }
 }
 
 async function reset() {
-  if (!confirm("Send *RST? This resets the instrument and turns the output off.")) return;
+  if (!confirm("Send *RST? This resets the instrument and turns all outputs off.")) return;
   try { applyState(await api("/api/reset", {})); toast("Instrument reset"); }
   catch (e) { toast(e.message, true); }
 }
@@ -174,30 +191,24 @@ async function reset() {
 function startPolling() {
   stopPolling();
   pollTimer = setInterval(async () => {
-    try { renderMeasure(await api("/api/measure")); }
-    catch (e) { /* transient; keep polling */ }
-  }, 600);
+    try { renderMeasure(await api("/api/measure")); } catch (e) { /* transient */ }
+  }, 700);
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 
-// ---- chart (pure canvas, dual axis V & I) --------------------------------
-function drawChart() {
-  const c = $("chart");
+// ---- per-channel chart (dual trace V & I) --------------------------------
+function drawChart(c, history) {
   const ctx = c.getContext("2d");
-  const W = c.width, H = c.height, pad = 28;
+  const W = c.width, H = c.height, pad = 14;
   ctx.clearRect(0, 0, W, H);
-
-  // grid
   ctx.strokeStyle = "#2a323d"; ctx.lineWidth = 1;
-  for (let g = 0; g <= 4; g++) {
-    const y = pad + (H - 2 * pad) * g / 4;
+  for (let g = 0; g <= 2; g++) {
+    const y = pad + (H - 2 * pad) * g / 2;
     ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke();
   }
   if (history.length < 2) return;
-
   const vMax = Math.max(1, ...history.map((p) => Math.abs(p.v)));
   const iMax = Math.max(0.1, ...history.map((p) => Math.abs(p.i)));
-
   const plot = (key, max, color) => {
     ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
     history.forEach((p, idx) => {
@@ -215,13 +226,11 @@ function drawChart() {
 $("btnConnect").onclick = () => connect(false);
 $("btnDemo").onclick = () => connect(true);
 $("btnDisconnect").onclick = disconnect;
-$("btnOutput").onclick = toggleOutput;
-$("btnApply").onclick = applySetpoints;
-$("btnProt").onclick = applyProtection;
-$("btnClearProt").onclick = clearProtection;
+$("btnAllOn").onclick = () => allOutput(true);
+$("btnAllOff").onclick = () => allOutput(false);
 $("btnReset").onclick = reset;
+$("tracking").onchange = (e) => setTracking(e.target.value);
 
-// On load, reflect any pre-existing connection (e.g. --demo startup).
 (async () => {
   try {
     const st = await api("/api/state");

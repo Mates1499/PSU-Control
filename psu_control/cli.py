@@ -3,9 +3,10 @@
 Examples::
 
     python -m psu_control.cli --host 192.168.1.50 idn
-    python -m psu_control.cli --host 192.168.1.50 set --voltage 12 --current 2 --on
     python -m psu_control.cli --host 192.168.1.50 measure
-    python -m psu_control.cli --host 192.168.1.50 off
+    python -m psu_control.cli --host 192.168.1.50 set --ch 1 --voltage 12 --current 2 --on
+    python -m psu_control.cli --host 192.168.1.50 on --ch 2
+    python -m psu_control.cli --host 192.168.1.50 off --all
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ def _connect(args: argparse.Namespace) -> ITN6332B:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="psu_control.cli",
-        description="Control an ITECH IT-N6332B power supply over SCPI.",
+        description="Control an ITECH IT-N6332B triple-channel power supply over SCPI.",
     )
     p.add_argument("--host", default="192.168.1.50", help="Instrument IP/hostname")
     p.add_argument("--port", type=int, default=DEFAULT_SCPI_PORT, help="Raw SCPI port")
@@ -34,29 +35,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=5.0, help="I/O timeout (s)")
 
     sub = p.add_subparsers(dest="command", required=True)
-
     sub.add_parser("idn", help="Print *IDN? identification")
     sub.add_parser("reset", help="Send *RST")
-    sub.add_parser("measure", help="Print measured V/I/P")
-    sub.add_parser("status", help="Print protection status")
-    sub.add_parser("on", help="Enable output")
-    sub.add_parser("off", help="Disable output")
-    sub.add_parser("clear", help="Clear latched protection")
+    sub.add_parser("measure", help="Print measured V/I/P for all channels")
 
-    s = sub.add_parser("set", help="Set voltage/current and optionally enable")
+    s = sub.add_parser("set", help="Set a channel's voltage/current and optionally enable")
+    s.add_argument("--ch", type=int, required=True, choices=(1, 2, 3))
     s.add_argument("--voltage", type=float, help="Voltage setpoint (V)")
-    s.add_argument("--current", type=float, help="Symmetric current limit (A)")
+    s.add_argument("--current", type=float, help="Current limit (A)")
     s.add_argument("--ovp", type=float, help="Over-voltage protection level (V)")
-    s.add_argument("--ocp", type=float, help="Over-current protection level (A)")
-    s.add_argument("--on", action="store_true", help="Enable output afterwards")
+    s.add_argument("--on", action="store_true", help="Enable the channel afterwards")
+
+    on = sub.add_parser("on", help="Enable output")
+    on.add_argument("--ch", type=int, choices=(1, 2, 3))
+    on.add_argument("--all", action="store_true")
+
+    off = sub.add_parser("off", help="Disable output")
+    off.add_argument("--ch", type=int, choices=(1, 2, 3))
+    off.add_argument("--all", action="store_true")
     return p
 
 
 def run(args: argparse.Namespace) -> int:
-    # Note: we manage the connection manually rather than via `with`, because
-    # the context manager fails safe by turning the output OFF on exit -- which
-    # would defeat the `on` / `set --on` commands. The CLI leaves the output
-    # state exactly as the chosen command set it.
+    # Manage the connection manually so output state set by `on`/`set --on`
+    # survives (the context manager would fail-safe everything off on exit).
     psu = _connect(args)
     try:
         cmd = args.command
@@ -66,31 +68,31 @@ def run(args: argparse.Namespace) -> int:
             psu.reset()
             print("Reset complete.")
         elif cmd == "measure":
-            print(psu.measure_all())
-        elif cmd == "status":
-            print(psu.protection_status())
-        elif cmd == "on":
-            psu.output_on()
-            print("Output ON")
-        elif cmd == "off":
-            psu.output_off()
-            print("Output OFF")
-        elif cmd == "clear":
-            psu.clear_protection()
-            print("Protection cleared.")
+            for name, m in psu.measure_all().items():
+                print(f"{name}: {m}")
         elif cmd == "set":
-            if args.voltage is not None:
-                psu.set_voltage(args.voltage)
-            if args.current is not None:
-                psu.set_current_limit(args.current)
+            ch = psu.channel(args.ch)
+            if args.voltage is not None and args.current is not None:
+                ch.apply(args.voltage, args.current)
+            else:
+                if args.voltage is not None:
+                    ch.set_voltage(args.voltage)
+                if args.current is not None:
+                    ch.set_current(args.current)
             if args.ovp is not None:
-                psu.set_ovp(args.ovp)
-            if args.ocp is not None:
-                psu.set_ocp(args.ocp)
+                ch.set_ovp(args.ovp)
             if args.on:
-                psu.output_on()
+                ch.output_on()
             psu.check_errors()
-            print("Applied:", psu.measure_all())
+            print(f"CH{args.ch}: {ch.measure()}")
+        elif cmd in ("on", "off"):
+            enable = cmd == "on"
+            if args.all or args.ch is None:
+                psu.all_output_on() if enable else psu.all_output_off()
+                print(f"All outputs {'ON' if enable else 'OFF'}")
+            else:
+                psu.channel(args.ch).set_output(enable)
+                print(f"CH{args.ch} {'ON' if enable else 'OFF'}")
     finally:
         psu.close()
     return 0
@@ -100,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return run(args)
-    except PSUError as exc:
+    except (PSUError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

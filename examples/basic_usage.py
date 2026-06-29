@@ -1,47 +1,39 @@
 #!/usr/bin/env python3
-"""Basic usage example for the ITECH IT-N6332B driver.
+"""Basic usage example for the ITECH IT-N6332B triple-channel driver.
 
-Run against a real instrument by editing the connection line below, or against
-the bundled mock server (see tests/mock_instrument.py) for a dry run.
+Edit the connection line for a real instrument, or point it at the bundled
+simulator (see psu_control/simulator.py) for a dry run.
 """
 
-from psu_control import ITN6332B, OutputMode
+from psu_control import ITN6332B
 
 
 def main() -> None:
-    # --- Connect -------------------------------------------------------
     # Raw TCP socket (no VISA required):
     psu = ITN6332B.open_tcp("192.168.1.50")
     # ...or via VISA (USB/GPIB/LAN):
-    # psu = ITN6332B.open_visa("USB0::0x2EC7::0x6300::800001::INSTR")
+    # psu = ITN6332B.open_visa("USB0::0x2EC7::...::INSTR")
 
     with psu:
         print("Connected to:", psu.idn())
         psu.reset()
         psu.clear_status()
 
-        # --- Configure a 12 V / 2 A constant-voltage output ------------
-        psu.set_mode(OutputMode.VOLTAGE)
-        psu.set_voltage(12.0)
-        psu.set_current_limit(2.0)  # symmetric +/-2 A (source & sink)
+        # CH1 / CH2: 0-30 V, 0-6 A, 180 W.  CH3: 0-5 V, 0-3 A, 15 W.
+        psu.ch1.apply(12.0, 2.0)   # 12 V, 2 A limit
+        psu.ch2.apply(5.0, 1.0)    # 5 V, 1 A limit
+        psu.ch3.apply(3.3, 0.5)    # 3.3 V, 0.5 A limit
 
-        # Arm protections.
-        psu.set_ovp(13.5)
-        psu.set_ocp(2.5)
-        psu.set_opp(30.0)
+        # Arm over-voltage protection on CH1.
+        psu.ch1.set_ovp(13.5)
 
-        # --- Energise --------------------------------------------------
-        psu.output_on()
+        psu.all_output_on()
         psu.check_errors()  # raise if the instrument rejected anything
 
-        # --- Read back -------------------------------------------------
-        m = psu.measure_all()
-        print(f"Output: {m}")
+        for name, m in psu.measure_all().items():
+            print(f"{name}: {m}")
 
-        status = psu.protection_status()
-        print("Protection:", status)
-
-    # Leaving the `with` block turns the output off and releases remote control.
+    # Leaving the `with` block turns every output off and releases remote control.
     print("Done.")
 
 
