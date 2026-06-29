@@ -1,23 +1,30 @@
-"""In-process SCPI simulator of an IT-N6332B (IT-M3100/IT-N6300 command set).
+"""In-process SCPI simulators for the supported PSU models.
 
-It speaks the raw-socket protocol on a background thread so the real
-:class:`~psu_control.ScpiConnection` TCP backend can talk to it unchanged. It
-models one or more bidirectional output channels with the ITECH ``CHANnel``
-selection handshake, CV/CC priority, the protection suite, slew settings and
-SCPI ``MIN`` / ``MAX`` range queries -- enough to exercise the driver, CLI and
-multi-channel web UI without any physical instrument.
+All simulators speak the raw-socket protocol on a background thread so the real
+:class:`~psu_control.ScpiConnection` TCP backend can talk to them unchanged.
+They model the minimum command set needed to exercise the driver, CLI and web UI
+without any physical instrument.
 
-It is *not* a precise electrical simulation. Use :class:`MockInstrument`
-directly, or the ``SimulatedInstrument`` alias.
+Classes
+-------
+MockInstrument / SimulatedInstrument
+    Simulates the ITECH IT-N6332B (IT-M3100/IT-N6300 SCPI command set).
+    Supports multiple bidirectional channels, CV/CC priority, protections,
+    slew settings and SCPI MIN/MAX range queries.
 
-    MockInstrument()            # 3 channels by default
-    MockInstrument(channels=1)  # single-output unit
+    ``MockInstrument()``           -- 3 channels by default
+    ``MockInstrument(channels=1)`` -- single-output unit
+
+CPX200DPSimulator
+    Simulates the Aim-TTi CPX200DP (suffix-addressed ASCII command set).
+    Always has 2 source-only channels.
 """
 
 from __future__ import annotations
 
 import math
 import random
+import re
 import socket
 import threading
 import time
@@ -291,5 +298,201 @@ class MockInstrument:
         return v, i
 
 
-# Public, descriptive alias for the simulator.
+# Public, descriptive alias for the IT-N6332B simulator.
 SimulatedInstrument = MockInstrument
+
+
+# -------------------------------------------------------------------------- #
+# Aim-TTi CPX200DP simulator
+# -------------------------------------------------------------------------- #
+
+_CPX_V_MAX = 60.0
+_CPX_I_MAX = 3.5
+
+_CMD_RE = re.compile(r"^([A-Z]+)(\d+)$")
+
+
+def _new_cpx_channel() -> dict:
+    return {
+        "output": False,
+        "voltage": 0.0,
+        "current": _CPX_I_MAX,
+        "ovp": _CPX_V_MAX + 1.0,
+        "ocp": _CPX_I_MAX + 0.5,
+        "tripped": False,
+        "load": 12.0,
+    }
+
+
+class CPX200DPSimulator:
+    """Tiny TCP responder simulating the Aim-TTi CPX200DP ASCII command set.
+
+    Two source-only channels (OUTPUT1/OUTPUT2) addressed via numeric command
+    suffixes (``VSET1``, ``ISET2``, ``VOUT1?``, etc.).
+    """
+
+    IDN = "THURLBY THANDAR INSTRUMENTS,CPX200DP,000000,1.00"
+
+    def __init__(self) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(1)
+        self.host, self.port = self._sock.getsockname()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._running = True
+        self.channels: dict[int, dict] = {1: _new_cpx_channel(), 2: _new_cpx_channel()}
+        self.received: list[str] = []
+
+    def start(self) -> "CPX200DPSimulator":
+        if not self._thread.is_alive():
+            self._thread.start()
+        return self
+
+    def __enter__(self) -> "CPX200DPSimulator":
+        return self.start()
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._running = False
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    # -- server loop -------------------------------------------------------
+
+    def _serve(self) -> None:
+        while self._running:
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                return
+            buf = b""
+            with conn:
+                while self._running:
+                    try:
+                        chunk = conn.recv(4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, _, buf = buf.partition(b"\n")
+                        raw = line.decode("ascii").strip()
+                        if not raw:
+                            continue
+                        self.received.append(raw)
+                        reply = self._handle(raw)
+                        if reply is not None:
+                            conn.sendall((reply + "\n").encode("ascii"))
+
+    # -- command dispatch --------------------------------------------------
+
+    def _handle(self, raw: str) -> str | None:
+        parts = raw.split(None, 1)
+        token = parts[0].upper()
+        value = parts[1].strip() if len(parts) > 1 else ""
+        is_query = token.endswith("?")
+        base_token = token.rstrip("?")
+
+        # --- channel-independent commands ---
+        if base_token == "*IDN":
+            return self.IDN
+        if base_token == "*RST":
+            for ch in self.channels.values():
+                ch.update(output=False, voltage=0.0, tripped=False)
+            return None
+        if base_token in ("*CLS", "*OPC"):
+            return "1" if is_query else None
+        if base_token == "*TST":
+            return "0"
+        if base_token in ("LOCAL", "REMOTE", "LOCKOUT", "TRIPRST"):
+            if base_token == "TRIPRST":
+                for ch in self.channels.values():
+                    ch["tripped"] = False
+            return None
+
+        # --- suffix-addressed commands: CMD<n> or CMD<n>? ---
+        m = _CMD_RE.match(base_token)
+        if not m:
+            return "0" if is_query else None
+        cmd_name, n = m.group(1), int(m.group(2))
+        if n not in self.channels:
+            return "0" if is_query else None
+        ch = self.channels[n]
+
+        if cmd_name == "VSET":
+            if is_query:
+                return f"{ch['voltage']:.3f}"
+            try:
+                ch["voltage"] = max(0.0, min(_CPX_V_MAX, float(value)))
+            except ValueError:
+                pass
+            return None
+
+        if cmd_name == "ISET":
+            if is_query:
+                return f"{ch['current']:.3f}"
+            try:
+                ch["current"] = max(0.0, min(_CPX_I_MAX, float(value)))
+            except ValueError:
+                pass
+            return None
+
+        if cmd_name == "VOUT":
+            if is_query:
+                v, _ = self._measure(ch)
+                return f"{v:.3f}"
+            return None
+
+        if cmd_name == "IOUT":
+            if is_query:
+                _, i = self._measure(ch)
+                return f"{i:.3f}"
+            return None
+
+        if cmd_name == "OUTPUT":
+            if is_query:
+                return "1" if ch["output"] else "0"
+            ch["output"] = value.strip() in ("1", "ON")
+            return None
+
+        if cmd_name == "OVP":
+            if is_query:
+                return f"{ch['ovp']:.3f}"
+            try:
+                ch["ovp"] = float(value)
+            except ValueError:
+                pass
+            return None
+
+        if cmd_name == "OCP":
+            if is_query:
+                return f"{ch['ocp']:.3f}"
+            try:
+                ch["ocp"] = float(value)
+            except ValueError:
+                pass
+            return None
+
+        if cmd_name == "LSR":
+            return "1" if ch["tripped"] else "0"
+
+        return "0" if is_query else None
+
+    # -- electrical model --------------------------------------------------
+
+    def _measure(self, ch: dict) -> tuple[float, float]:
+        """Model a CV supply with CC limiting into a resistive load."""
+        if not ch["output"]:
+            return 0.0, 0.0
+        v = ch["voltage"]
+        i = v / ch["load"] if ch["load"] > 0 else 0.0
+        if i > ch["current"] > 0:
+            i = ch["current"]
+            v = i * ch["load"]
+        return v, i

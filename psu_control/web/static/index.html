@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ITECH IT-N6332B — Control Panel</title>
+  <title>PSU Control Panel</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -11,8 +11,8 @@
     <div class="brand">
       <span class="logo">⎓</span>
       <div>
-        <h1>IT-N6332B</h1>
-        <p class="subtitle">Bidirectional Programmable DC Power Supply · SCPI</p>
+        <h1 id="modelLabel">PSU Control</h1>
+        <p class="subtitle" id="modelSub">Programmable DC Power Supply · SCPI</p>
       </div>
     </div>
     <div class="conn-status">
@@ -25,8 +25,14 @@
     <section class="card">
       <h2>Connection</h2>
       <div class="row">
+        <label>Model
+          <select id="model">
+            <option value="itn6332b">ITECH IT-N6332B (bidirectional)</option>
+            <option value="cpx200dp">Aim-TTi CPX200DP (dual-output)</option>
+          </select>
+        </label>
         <label>Host / IP<input type="text" id="host" placeholder="192.168.1.50" value="192.168.1.50" /></label>
-        <label>Port<input type="number" id="port" value="30000" /></label>
+        <label>Port<input type="number" id="port" placeholder="(default)" /></label>
         <label class="grow">VISA resource (optional)<input type="text" id="visa" placeholder="USB0::0x2EC7::...::INSTR" /></label>
       </div>
       <div class="row btn-row">

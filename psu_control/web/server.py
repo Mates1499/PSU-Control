@@ -1,16 +1,24 @@
-"""Stdlib HTTP backend for the IT-N6332B web UI (multi-channel).
+"""Stdlib HTTP backend for the multi-channel PSU web UI.
 
 A single-process, dependency-free server (built on ``http.server``) that serves
-the dashboard and exposes a JSON REST API wrapping the :class:`ITN6332B` driver.
+the dashboard and exposes a JSON REST API wrapping any :class:`BasePSUDriver`.
 A global :class:`Controller` holds the one instrument connection, guarded by a
-lock so concurrent browser requests are serialised onto it. All available
-channels (``CHANnel:STATe?``) are discovered on connect and controlled
-independently.
+lock so concurrent browser requests are serialised onto it.
 
-JSON API:
+Supported models (passed as ``model`` in the ``/api/connect`` body):
+
+* ``"itn6332b"`` (default) -- ITECH IT-N6332B; channels discovered via
+  ``CHANnel:STATe?``; built-in simulator uses :class:`MockInstrument`.
+* ``"cpx200dp"``            -- Aim-TTi CPX200DP; always channels 1 and 2;
+  built-in simulator uses :class:`CPX200DPSimulator`.
+
+JSON API
+--------
+::
+
     GET  /api/state                          -> connection + every channel
     GET  /api/measure                        -> per-channel V/I/P + output
-    POST /api/connect                        {host, port, visa, demo}
+    POST /api/connect                        {host, port, visa, demo, model?}
     POST /api/disconnect
     POST /api/reset
     POST /api/all_output                     {on: bool}
@@ -28,9 +36,12 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from .. import ITN6332B, Priority, PSUError
+from ..base import BasePSUDriver
+from ..exceptions import PSUError
+from ..it_n6332b import ITN6332B
+from ..cpx200dp import CPX200DP
 from ..scpi import DEFAULT_SCPI_PORT
-from ..simulator import SimulatedInstrument
+from ..simulator import SimulatedInstrument, CPX200DPSimulator
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _CONTENT_TYPES = {
@@ -40,38 +51,64 @@ _CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
+# Registry: model name -> (DriverClass, SimulatorClass, default_tcp_port)
+_MODELS: dict[str, tuple] = {
+    "itn6332b": (ITN6332B, SimulatedInstrument, DEFAULT_SCPI_PORT),
+    "cpx200dp":  (CPX200DP,  CPX200DPSimulator,  CPX200DP.DEFAULT_TCP_PORT),
+}
+
 
 class Controller:
     """Owns the single PSU connection and serialises access to it."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._psu: Optional[ITN6332B] = None
-        self._sim: Optional[SimulatedInstrument] = None
+        self._psu: Optional[BasePSUDriver] = None
+        self._sim = None
         self._idn: str = ""
         self._target: str = ""
+        self._model: str = ""
         self._channels: list[int] = []
         self._ranges: dict[int, dict[str, Any]] = {}
 
     # -- connection -------------------------------------------------------
 
-    def connect(self, *, host: str = "", port: int = DEFAULT_SCPI_PORT,
-                visa: str = "", demo: bool = False) -> dict[str, Any]:
+    def connect(
+        self,
+        *,
+        host: str = "",
+        port: int = 0,
+        visa: str = "",
+        demo: bool = False,
+        model: str = "itn6332b",
+    ) -> dict[str, Any]:
+        model_key = model.lower().replace("-", "").replace("_", "")
+        if model_key not in _MODELS:
+            raise PSUError(
+                f"Unknown model {model!r}. Choose from: {list(_MODELS)}"
+            )
+        DriverClass, SimClass, default_port = _MODELS[model_key]
+
         with self._lock:
             self._teardown()
+            self._model = model_key
             if demo:
-                self._sim = SimulatedInstrument().start()
-                self._sim.noise = True
-                self._psu = ITN6332B.open_tcp(self._sim.host, self._sim.port)
-                self._target = "demo (built-in simulator)"
+                self._sim = SimClass().start()
+                # Noise only on IT-N6332B simulator (MockInstrument)
+                if hasattr(self._sim, "noise"):
+                    self._sim.noise = True
+                self._psu = DriverClass.open_tcp(self._sim.host, self._sim.port)
+                self._target = f"demo ({model_key} simulator)"
             elif visa:
-                self._psu = ITN6332B.open_visa(visa)
+                self._psu = DriverClass.open_visa(visa)
                 self._target = visa
             else:
                 if not host:
-                    raise PSUError("A host (or VISA resource, or demo mode) is required")
-                self._psu = ITN6332B.open_tcp(host, port)
-                self._target = f"{host}:{port}"
+                    raise PSUError(
+                        "A host (or VISA resource, or demo mode) is required"
+                    )
+                self._psu = DriverClass.open_tcp(host, port or default_port)
+                self._target = f"{host}:{port or default_port}"
             self._idn = self._psu.idn()
             self._channels = self._psu.available_channels()
             self._ranges = {}
@@ -79,7 +116,9 @@ class Controller:
                 try:
                     vlo, vhi = self._psu.channel(n).voltage_range()
                     ilo, ihi = self._psu.channel(n).current_range()
-                    self._ranges[n] = {"v_min": vlo, "v_max": vhi, "i_min": ilo, "i_max": ihi}
+                    self._ranges[n] = {
+                        "v_min": vlo, "v_max": vhi, "i_min": ilo, "i_max": ihi
+                    }
                 except Exception:
                     self._ranges[n] = {}
         return self.state()
@@ -100,12 +139,13 @@ class Controller:
         self._sim = None
         self._idn = ""
         self._target = ""
+        self._model = ""
         self._channels = []
         self._ranges = {}
 
-    def _require(self) -> ITN6332B:
+    def _require(self) -> BasePSUDriver:
         if self._psu is None:
-            raise PSUError("Not connected to an instrument")
+            raise PSUError("Not connected to an instrument. Use /api/connect first.")
         return self._psu
 
     # -- reads ------------------------------------------------------------
@@ -116,7 +156,7 @@ class Controller:
         return {
             "number": n,
             "output": ch.output_enabled,
-            "priority": ch.get_priority().name,
+            "priority": ch.get_priority(),   # always a string: "VOLTAGE" / "CURRENT"
             "voltage_set": ch.get_voltage(),
             "current_set": ch.get_current(),
             "ranges": self._ranges.get(n, {}),
@@ -133,6 +173,7 @@ class Controller:
                 "connected": True,
                 "target": self._target,
                 "idn": self._idn,
+                "model": self._model,
                 "demo": self._sim is not None,
                 "channels": [self._channel_state(n) for n in self._channels],
             }
@@ -155,12 +196,17 @@ class Controller:
 
     # -- writes -----------------------------------------------------------
 
-    def set_setpoint(self, number: int, voltage: Optional[float] = None,
-                     current: Optional[float] = None, priority: Optional[str] = None) -> dict[str, Any]:
+    def set_setpoint(
+        self,
+        number: int,
+        voltage: Optional[float] = None,
+        current: Optional[float] = None,
+        priority: Optional[str] = None,
+    ) -> dict[str, Any]:
         with self._lock:
             ch = self._require().channel(number)
             if priority is not None:
-                ch.set_priority(Priority[priority.upper()])
+                ch.set_priority(priority.upper())
             if voltage is not None and current is not None:
                 ch.apply(float(voltage), float(current))
             elif voltage is not None:
@@ -175,8 +221,13 @@ class Controller:
             self._require().channel(number).set_output(bool(on))
         return self.measure()
 
-    def set_protection(self, number: int, ovp: Optional[float] = None,
-                       ocp: Optional[float] = None, opp: Optional[float] = None) -> dict[str, Any]:
+    def set_protection(
+        self,
+        number: int,
+        ovp: Optional[float] = None,
+        ocp: Optional[float] = None,
+        opp: Optional[float] = None,
+    ) -> dict[str, Any]:
         with self._lock:
             ch = self._require().channel(number)
             if ovp is not None:
@@ -216,7 +267,7 @@ def _meas(m) -> dict[str, float]:
 
 class _Handler(BaseHTTPRequestHandler):
     controller: Controller
-    server_version = "ITN6332B-WebUI/3.1"
+    server_version = "PSUControl-WebUI/4.0"
 
     def log_message(self, *args) -> None:
         pass
@@ -251,7 +302,9 @@ class _Handler(BaseHTTPRequestHandler):
             body = fh.read()
         ext = os.path.splitext(full)[1].lower()
         self.send_response(200)
-        self.send_header("Content-Type", _CONTENT_TYPES.get(ext, "application/octet-stream"))
+        self.send_header(
+            "Content-Type", _CONTENT_TYPES.get(ext, "application/octet-stream")
+        )
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -269,9 +322,10 @@ class _Handler(BaseHTTPRequestHandler):
                 d = self._read_json()
                 self._send_json(ctrl.connect(
                     host=str(d.get("host", "")).strip(),
-                    port=int(d.get("port") or DEFAULT_SCPI_PORT),
+                    port=int(d.get("port") or 0),
                     visa=str(d.get("visa", "")).strip(),
                     demo=bool(d.get("demo", False)),
+                    model=str(d.get("model", "itn6332b")),
                 ))
             elif method == "POST" and path == "/api/disconnect":
                 self._send_json(ctrl.disconnect())
@@ -285,12 +339,20 @@ class _Handler(BaseHTTPRequestHandler):
                 d = self._read_json()
                 if action == "setpoint":
                     self._send_json(ctrl.set_setpoint(
-                        n, _opt_float(d.get("voltage")), _opt_float(d.get("current")), d.get("priority")))
+                        n,
+                        _opt_float(d.get("voltage")),
+                        _opt_float(d.get("current")),
+                        d.get("priority"),
+                    ))
                 elif action == "output":
                     self._send_json(ctrl.set_output(n, bool(d.get("on"))))
                 elif action == "protection":
                     self._send_json(ctrl.set_protection(
-                        n, _opt_float(d.get("ovp")), _opt_float(d.get("ocp")), _opt_float(d.get("opp"))))
+                        n,
+                        _opt_float(d.get("ovp")),
+                        _opt_float(d.get("ocp")),
+                        _opt_float(d.get("opp")),
+                    ))
                 elif action == "clear_protection":
                     self._send_json(ctrl.clear_protection(n))
                 else:
@@ -304,7 +366,9 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001
-            self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+            self._send_json(
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500
+            )
 
     def do_GET(self) -> None:  # noqa: N802
         self._dispatch("GET")
@@ -335,24 +399,33 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     p = argparse.ArgumentParser(
         prog="psu_control.web",
-        description="Web UI for the ITECH IT-N6332B power supply.",
+        description="Web UI for programmable DC power supplies.",
     )
     p.add_argument("--host", default="127.0.0.1", help="Address to bind (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=8080, help="Port to listen on (default 8080)")
-    p.add_argument("--demo", action="store_true",
-                   help="Auto-connect to the built-in simulator on startup (no hardware).")
+    p.add_argument(
+        "--model",
+        default="itn6332b",
+        choices=list(_MODELS),
+        help="PSU model to use in demo mode (default: itn6332b)",
+    )
+    p.add_argument(
+        "--demo",
+        action="store_true",
+        help="Auto-connect to the built-in simulator on startup.",
+    )
     args = p.parse_args(argv)
 
     srv = create_server(args.host, args.port)
     ctrl: Controller = srv.RequestHandlerClass.controller  # type: ignore[attr-defined]
     if args.demo:
         try:
-            ctrl.connect(demo=True)
-            print("Demo mode: connected to built-in simulator.")
+            ctrl.connect(demo=True, model=args.model)
+            print(f"Demo mode: connected to built-in {args.model} simulator.")
         except PSUError as exc:
             print(f"Demo connect failed: {exc}")
 
-    print(f"IT-N6332B web UI serving at http://{args.host}:{args.port}/")
+    print(f"PSU Control web UI serving at http://{args.host}:{args.port}/")
     print("Press Ctrl+C to stop.")
     try:
         srv.serve_forever()

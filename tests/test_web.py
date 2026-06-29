@@ -103,6 +103,31 @@ def test_error_when_not_connected():
         assert "connect" in body["error"].lower()
 
 
+def test_cpx200dp_demo_two_channels():
+    with _Server() as s:
+        status, st = s.call("POST", "/api/connect", {"demo": True, "model": "cpx200dp"})
+        assert status == 200 and st["connected"] is True
+        assert st["model"] == "cpx200dp"
+        # CPX200DP always has exactly 2 channels.
+        assert [c["number"] for c in st["channels"]] == [1, 2]
+        # Source-only: current min must be 0 (not negative).
+        for ch in st["channels"]:
+            assert ch["ranges"].get("i_min", 0) == 0.0
+
+
+def test_cpx200dp_multichannel_setpoint():
+    with _Server() as s:
+        s.call("POST", "/api/connect", {"demo": True, "model": "cpx200dp"})
+        s.call("POST", "/api/channel/1/setpoint", {"voltage": 12.0, "current": 3.5})
+        s.call("POST", "/api/channel/2/setpoint", {"voltage": 6.0, "current": 3.5})
+        s.call("POST", "/api/all_output", {"on": True})
+        _, m = s.call("GET", "/api/measure")
+        by = {c["number"]: c for c in m["channels"]}
+        # 12 V / 12 ohm = 1 A; 6 V / 12 ohm = 0.5 A
+        assert abs(by[1]["measurement"]["current"] - 1.0) < 0.3
+        assert abs(by[2]["measurement"]["current"] - 0.5) < 0.3
+
+
 def _run_all():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

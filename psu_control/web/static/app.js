@@ -26,8 +26,9 @@ function toast(msg, isError) {
 
 async function connect(demo) {
   try {
-    const body = demo ? { demo: true }
-      : { host: $("host").value, port: parseInt($("port").value, 10), visa: $("visa").value };
+    const model = $("model").value;
+    const body = demo ? { demo: true, model }
+      : { host: $("host").value, port: parseInt($("port").value, 10) || 0, visa: $("visa").value, model };
     onConnected(await api("/api/connect", body));
     toast(demo ? "Connected to simulator" : "Connected");
   } catch (e) { toast(e.message, true); }
@@ -39,6 +40,11 @@ async function disconnect() {
   toast("Disconnected");
 }
 
+const _MODEL_LABELS = {
+  "itn6332b": { title: "IT-N6332B", sub: "Bidirectional Programmable DC Power Supply · SCPI" },
+  "cpx200dp":  { title: "CPX200DP",  sub: "Dual-Output Programmable DC Power Supply · Aim-TTi" },
+};
+
 function onConnected(st) {
   connected = true;
   $("connDot").classList.add("on");
@@ -48,6 +54,9 @@ function onConnected(st) {
   $("btnDemo").disabled = true;
   $("btnDisconnect").disabled = false;
   ["btnAllOn", "btnAllOff", "btnReset"].forEach((id) => ($(id).disabled = false));
+  const lbl = _MODEL_LABELS[st.model] || { title: "PSU Control", sub: "Programmable DC Power Supply · SCPI" };
+  $("modelLabel").textContent = lbl.title;
+  $("modelSub").textContent = lbl.sub;
   buildChannels(st.channels || []);
   applyState(st);
   startPolling();

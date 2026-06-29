@@ -1,11 +1,19 @@
-"""Command-line interface for quick control of an IT-N6332B.
+"""Command-line interface for quick control of a programmable DC power supply.
+
+Supported models (--model flag):
+    itn6332b  -- ITECH IT-N6332B (default; TCP port 30000)
+    cpx200dp  -- Aim-TTi CPX200DP (TCP port 9221)
 
 Examples::
 
     python -m psu_control.cli --host 192.168.1.50 idn
     python -m psu_control.cli --host 192.168.1.50 measure
-    python -m psu_control.cli --host 192.168.1.50 set --voltage 12 --current 2 --priority cv --on
-    python -m psu_control.cli --host 192.168.1.50 off
+    python -m psu_control.cli --host 192.168.1.50 channels
+    python -m psu_control.cli --host 192.168.1.50 --channel 2 set --voltage 12 --current 2 --on
+    python -m psu_control.cli --host 192.168.1.50 --all off
+
+    python -m psu_control.cli --model cpx200dp --host 192.168.1.72 idn
+    python -m psu_control.cli --model cpx200dp --host 192.168.1.72 measure
 """
 
 from __future__ import annotations
@@ -13,28 +21,51 @@ from __future__ import annotations
 import argparse
 import sys
 
-from . import ITN6332B, Priority, PSUError
-from .scpi import DEFAULT_SCPI_PORT
+from .base import BasePSUDriver
+from .exceptions import PSUError
+from .it_n6332b import ITN6332B
+from .cpx200dp import CPX200DP
 
-_PRIORITY = {"cv": Priority.VOLTAGE, "cc": Priority.CURRENT,
-             "voltage": Priority.VOLTAGE, "current": Priority.CURRENT}
+_PRIORITY = {
+    "cv": "VOLTAGE", "voltage": "VOLTAGE",
+    "cc": "CURRENT", "current": "CURRENT",
+}
+
+_MODELS: dict[str, type[BasePSUDriver]] = {
+    "itn6332b": ITN6332B,
+    "cpx200dp": CPX200DP,
+}
 
 
-def _connect(args: argparse.Namespace) -> ITN6332B:
+def _connect(args: argparse.Namespace) -> BasePSUDriver:
+    cls = _MODELS[args.model]
     if args.visa:
-        return ITN6332B.open_visa(args.visa, channel=args.channel, timeout=args.timeout)
-    return ITN6332B.open_tcp(args.host, args.port, channel=args.channel, timeout=args.timeout)
+        return cls.open_visa(args.visa, timeout=args.timeout)
+    port = args.port or cls.DEFAULT_TCP_PORT
+    return cls.open_tcp(args.host, port, timeout=args.timeout)
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="psu_control.cli",
-        description="Control an ITECH IT-N6332B bidirectional power supply over SCPI.",
+        description="Control a programmable DC power supply over SCPI.",
     )
     p.add_argument("--host", default="192.168.1.50", help="Instrument IP/hostname")
-    p.add_argument("--port", type=int, default=DEFAULT_SCPI_PORT, help="Raw SCPI port (default 30000)")
+    p.add_argument(
+        "--port", type=int, default=0,
+        help="Raw SCPI port (default: model-specific; 30000 for IT-N6332B, 9221 for CPX200DP)",
+    )
     p.add_argument("--visa", help="Use a VISA resource string instead of TCP")
-    p.add_argument("--channel", type=int, default=1, help="Channel number (1-16); used by set/on/off/clear")
+    p.add_argument(
+        "--model",
+        default="itn6332b",
+        choices=sorted(_MODELS),
+        help="PSU model (default: itn6332b)",
+    )
+    p.add_argument(
+        "--channel", type=int, default=1,
+        help="Channel number; used by set/on/off/clear (default 1)",
+    )
     p.add_argument("--all", action="store_true", help="Apply on/off to every available channel")
     p.add_argument("--timeout", type=float, default=5.0, help="I/O timeout (s)")
 
@@ -60,14 +91,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> int:
     # Manage the connection manually so output state set by `on`/`set --on`
-    # survives (the context manager fails everything off on exit).
+    # survives (the context manager turns the output off on exit).
     psu = _connect(args)
     try:
         cmd = args.command
         if cmd == "idn":
             print(psu.idn())
         elif cmd == "reset":
-            psu.reset(); print("Reset complete.")
+            psu.reset()
+            print("Reset complete.")
         elif cmd == "channels":
             print("Available channels:", ", ".join(str(n) for n in psu.available_channels()))
         elif cmd == "measure":

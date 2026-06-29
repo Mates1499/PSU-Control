@@ -50,9 +50,12 @@ def test_priority_roundtrip():
     with MockInstrument() as mock:
         psu = _open(mock)
         psu.set_priority(Priority.CURRENT)
-        assert psu.get_priority() is Priority.CURRENT
+        assert psu.get_priority() == "CURRENT"
         psu.set_priority(Priority.VOLTAGE)
-        assert psu.get_priority() is Priority.VOLTAGE
+        assert psu.get_priority() == "VOLTAGE"
+        # set_priority also accepts plain strings
+        psu.set_priority("cc")
+        assert psu.get_priority() == "CURRENT"
         psu.close()
 
 
