@@ -32,6 +32,7 @@ from .exceptions import (
 from .scpi import ScpiConnection
 from .it_n6332b import (
     ITN6332B,
+    Channel,
     Priority,
     FunctionMode,
     Measurement,
@@ -39,6 +40,7 @@ from .it_n6332b import (
 
 __all__ = [
     "ITN6332B",
+    "Channel",
     "Priority",
     "FunctionMode",
     "Measurement",

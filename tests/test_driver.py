@@ -32,7 +32,7 @@ def test_selects_channel_on_open():
     with MockInstrument() as mock:
         psu = _open(mock)
         psu.idn()  # round-trip flush so the async CHANnel write is recorded
-        assert psu.channel == 1
+        assert psu.selected_channel == 1
         assert any(c.upper().startswith("CHAN") for c in mock.received)
         psu.close()
 
@@ -99,7 +99,7 @@ def test_protection_set_and_clear():
         psu.set_ocp(2.5)
         psu.set_opp(60.0)
         assert psu.protection_tripped() is False
-        mock.state["ques"] = 0x0001
+        mock.channels[1]["ques"] = 0x0001
         assert psu.protection_tripped() is True
         psu.clear_protection()
         assert psu.protection_tripped() is False
@@ -117,15 +117,44 @@ def test_output_toggle():
         psu.close()
 
 
+def test_multichannel_independent_control():
+    with MockInstrument(channels=3) as mock:
+        psu = _open(mock)
+        assert psu.available_channels() == [1, 2, 3]
+        psu.channel(1).apply(24.0, 12.0)   # 24 V / 12 ohm -> 2 A
+        psu.channel(2).apply(12.0, 12.0)   # 12 V / 12 ohm -> 1 A
+        psu.channel(3).apply(6.0, 12.0)    # 6 V / 12 ohm -> 0.5 A
+        psu.all_output_on()
+        snap = psu.measure_all()
+        assert set(snap) == {1, 2, 3}
+        assert abs(snap[1].voltage - 24.0) < 1e-3
+        assert abs(snap[2].voltage - 12.0) < 1e-3
+        assert abs(snap[3].current - 0.5) < 1e-3
+        psu.close()
+
+
+def test_channel_proxy_selection_and_availability():
+    with MockInstrument(channels=2) as mock:
+        psu = _open(mock)
+        assert psu.available_channels() == [1, 2]      # only 2 present
+        assert psu.channel(2).available is True
+        assert psu.channel(1).output_enabled is False
+        psu.channel(2).output_on()
+        assert psu.channel(2).output_enabled is True
+        assert psu.channel(1).output_enabled is False  # independent
+        psu.close()
+
+
 def test_context_manager_fails_safe():
     with MockInstrument() as mock:
         with _open(mock) as psu:
             psu.output_on()
             assert psu.output_enabled is True
+        # On exit shutdown() turns every channel off; wait for the async writes.
         deadline = time.monotonic() + 1.0
-        while mock.state["output"] and time.monotonic() < deadline:
+        while any(c["output"] for c in mock.channels.values()) and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert mock.state["output"] is False
+        assert not any(c["output"] for c in mock.channels.values())
 
 
 def _run_all():

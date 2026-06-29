@@ -1,20 +1,23 @@
-"""Stdlib HTTP backend for the IT-N6332B web UI.
+"""Stdlib HTTP backend for the IT-N6332B web UI (multi-channel).
 
 A single-process, dependency-free server (built on ``http.server``) that serves
-the dashboard and exposes a small JSON REST API wrapping the :class:`ITN6332B`
-driver. A global :class:`Controller` holds the one instrument connection,
-guarded by a lock so concurrent browser requests are serialised onto it.
+the dashboard and exposes a JSON REST API wrapping the :class:`ITN6332B` driver.
+A global :class:`Controller` holds the one instrument connection, guarded by a
+lock so concurrent browser requests are serialised onto it. All available
+channels (``CHANnel:STATe?``) are discovered on connect and controlled
+independently.
 
 JSON API:
-    GET  /api/state            -> full snapshot (priority, setpoints, ranges)
-    GET  /api/measure          -> lightweight V/I/P + output + protection flag
-    POST /api/connect          {host, port, visa, demo}
+    GET  /api/state                          -> connection + every channel
+    GET  /api/measure                        -> per-channel V/I/P + output
+    POST /api/connect                        {host, port, visa, demo}
     POST /api/disconnect
-    POST /api/output           {on: bool}
-    POST /api/setpoint         {voltage?, current?, priority?}
-    POST /api/protection       {ovp?, ocp?, opp?}
-    POST /api/clear_protection
     POST /api/reset
+    POST /api/all_output                     {on: bool}
+    POST /api/channel/<n>/setpoint           {voltage?, current?, priority?}
+    POST /api/channel/<n>/output             {on: bool}
+    POST /api/channel/<n>/protection         {ovp?, ocp?, opp?}
+    POST /api/channel/<n>/clear_protection
 """
 
 from __future__ import annotations
@@ -47,7 +50,8 @@ class Controller:
         self._sim: Optional[SimulatedInstrument] = None
         self._idn: str = ""
         self._target: str = ""
-        self._ranges: dict[str, Any] = {}
+        self._channels: list[int] = []
+        self._ranges: dict[int, dict[str, Any]] = {}
 
     # -- connection -------------------------------------------------------
 
@@ -69,13 +73,15 @@ class Controller:
                 self._psu = ITN6332B.open_tcp(host, port)
                 self._target = f"{host}:{port}"
             self._idn = self._psu.idn()
-            # Query the device's actual ranges once, for UI input bounds.
-            try:
-                vlo, vhi = self._psu.voltage_range()
-                ilo, ihi = self._psu.current_range()
-                self._ranges = {"v_min": vlo, "v_max": vhi, "i_min": ilo, "i_max": ihi}
-            except Exception:
-                self._ranges = {}
+            self._channels = self._psu.available_channels()
+            self._ranges = {}
+            for n in self._channels:
+                try:
+                    vlo, vhi = self._psu.channel(n).voltage_range()
+                    ilo, ihi = self._psu.channel(n).current_range()
+                    self._ranges[n] = {"v_min": vlo, "v_max": vhi, "i_min": ilo, "i_max": ihi}
+                except Exception:
+                    self._ranges[n] = {}
         return self.state()
 
     def disconnect(self) -> dict[str, Any]:
@@ -94,6 +100,7 @@ class Controller:
         self._sim = None
         self._idn = ""
         self._target = ""
+        self._channels = []
         self._ranges = {}
 
     def _require(self) -> ITN6332B:
@@ -103,78 +110,93 @@ class Controller:
 
     # -- reads ------------------------------------------------------------
 
+    def _channel_state(self, n: int) -> dict[str, Any]:
+        ch = self._psu.channel(n)  # type: ignore[union-attr]
+        m = ch.measure()
+        return {
+            "number": n,
+            "output": ch.output_enabled,
+            "priority": ch.get_priority().name,
+            "voltage_set": ch.get_voltage(),
+            "current_set": ch.get_current(),
+            "ranges": self._ranges.get(n, {}),
+            "measurement": _meas(m),
+            "mode": ch.regulation_mode(),
+            "protection_tripped": ch.protection_tripped(),
+        }
+
     def state(self) -> dict[str, Any]:
         with self._lock:
             if self._psu is None:
                 return {"connected": False}
-            psu = self._psu
-            m = psu.measure()
             return {
                 "connected": True,
                 "target": self._target,
                 "idn": self._idn,
                 "demo": self._sim is not None,
-                "output": psu.output_enabled,
-                "priority": psu.get_priority().name,
-                "voltage_set": psu.get_voltage(),
-                "current_set": psu.get_current(),
-                "ranges": self._ranges,
-                "measurement": _meas(m),
-                "mode": psu.regulation_mode(),
-                "protection_tripped": psu.protection_tripped(),
+                "channels": [self._channel_state(n) for n in self._channels],
             }
 
     def measure(self) -> dict[str, Any]:
         with self._lock:
             if self._psu is None:
                 return {"connected": False}
-            psu = self._psu
-            return {
-                "connected": True,
-                "output": psu.output_enabled,
-                "measurement": _meas(psu.measure()),
-                "mode": psu.regulation_mode(),
-                "protection_tripped": psu.protection_tripped(),
-            }
+            out = []
+            for n in self._channels:
+                ch = self._psu.channel(n)
+                out.append({
+                    "number": n,
+                    "output": ch.output_enabled,
+                    "measurement": _meas(ch.measure()),
+                    "mode": ch.regulation_mode(),
+                    "protection_tripped": ch.protection_tripped(),
+                })
+            return {"connected": True, "channels": out}
 
     # -- writes -----------------------------------------------------------
 
-    def set_output(self, on: bool) -> dict[str, Any]:
+    def set_setpoint(self, number: int, voltage: Optional[float] = None,
+                     current: Optional[float] = None, priority: Optional[str] = None) -> dict[str, Any]:
         with self._lock:
-            self._require().set_output(bool(on))
+            ch = self._require().channel(number)
+            if priority is not None:
+                ch.set_priority(Priority[priority.upper()])
+            if voltage is not None and current is not None:
+                ch.apply(float(voltage), float(current))
+            elif voltage is not None:
+                ch.set_voltage(float(voltage))
+            elif current is not None:
+                ch.set_current(float(current))
+            self._psu.check_errors()  # type: ignore[union-attr]
+        return self.state()
+
+    def set_output(self, number: int, on: bool) -> dict[str, Any]:
+        with self._lock:
+            self._require().channel(number).set_output(bool(on))
         return self.measure()
 
-    def set_setpoint(self, voltage: Optional[float] = None, current: Optional[float] = None,
-                     priority: Optional[str] = None) -> dict[str, Any]:
+    def set_protection(self, number: int, ovp: Optional[float] = None,
+                       ocp: Optional[float] = None, opp: Optional[float] = None) -> dict[str, Any]:
         with self._lock:
-            psu = self._require()
-            if priority is not None:
-                psu.set_priority(Priority[priority.upper()])
-            if voltage is not None and current is not None:
-                psu.apply(float(voltage), float(current))
-            elif voltage is not None:
-                psu.set_voltage(float(voltage))
-            elif current is not None:
-                psu.set_current(float(current))
-            psu.check_errors()
-        return self.state()
-
-    def set_protection(self, ovp: Optional[float] = None, ocp: Optional[float] = None,
-                       opp: Optional[float] = None) -> dict[str, Any]:
-        with self._lock:
-            psu = self._require()
+            ch = self._require().channel(number)
             if ovp is not None:
-                psu.set_ovp(float(ovp))
+                ch.set_ovp(float(ovp))
             if ocp is not None:
-                psu.set_ocp(float(ocp))
+                ch.set_ocp(float(ocp))
             if opp is not None:
-                psu.set_opp(float(opp))
-            psu.check_errors()
+                ch.set_opp(float(opp))
+            self._psu.check_errors()  # type: ignore[union-attr]
         return self.state()
 
-    def clear_protection(self) -> dict[str, Any]:
+    def clear_protection(self, number: int) -> dict[str, Any]:
         with self._lock:
-            self._require().clear_protection()
+            self._require().channel(number).clear_protection()
+        return self.measure()
+
+    def all_output(self, on: bool) -> dict[str, Any]:
+        with self._lock:
+            psu = self._require()
+            psu.all_output_on() if on else psu.all_output_off()
         return self.measure()
 
     def reset(self) -> dict[str, Any]:
@@ -194,7 +216,7 @@ def _meas(m) -> dict[str, float]:
 
 class _Handler(BaseHTTPRequestHandler):
     controller: Controller
-    server_version = "ITN6332B-WebUI/3.0"
+    server_version = "ITN6332B-WebUI/3.1"
 
     def log_message(self, *args) -> None:
         pass
@@ -237,6 +259,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _dispatch(self, method: str) -> None:
         ctrl = self.controller
         path = self.path.split("?", 1)[0]
+        parts = [p for p in path.split("/") if p]
         try:
             if method == "GET" and path == "/api/state":
                 self._send_json(ctrl.state())
@@ -252,26 +275,26 @@ class _Handler(BaseHTTPRequestHandler):
                 ))
             elif method == "POST" and path == "/api/disconnect":
                 self._send_json(ctrl.disconnect())
-            elif method == "POST" and path == "/api/output":
-                self._send_json(ctrl.set_output(bool(self._read_json().get("on"))))
-            elif method == "POST" and path == "/api/setpoint":
-                d = self._read_json()
-                self._send_json(ctrl.set_setpoint(
-                    voltage=_opt_float(d.get("voltage")),
-                    current=_opt_float(d.get("current")),
-                    priority=d.get("priority"),
-                ))
-            elif method == "POST" and path == "/api/protection":
-                d = self._read_json()
-                self._send_json(ctrl.set_protection(
-                    ovp=_opt_float(d.get("ovp")),
-                    ocp=_opt_float(d.get("ocp")),
-                    opp=_opt_float(d.get("opp")),
-                ))
-            elif method == "POST" and path == "/api/clear_protection":
-                self._send_json(ctrl.clear_protection())
             elif method == "POST" and path == "/api/reset":
                 self._send_json(ctrl.reset())
+            elif method == "POST" and path == "/api/all_output":
+                self._send_json(ctrl.all_output(bool(self._read_json().get("on"))))
+            elif method == "POST" and len(parts) == 4 and parts[:2] == ["api", "channel"]:
+                n = int(parts[2])
+                action = parts[3]
+                d = self._read_json()
+                if action == "setpoint":
+                    self._send_json(ctrl.set_setpoint(
+                        n, _opt_float(d.get("voltage")), _opt_float(d.get("current")), d.get("priority")))
+                elif action == "output":
+                    self._send_json(ctrl.set_output(n, bool(d.get("on"))))
+                elif action == "protection":
+                    self._send_json(ctrl.set_protection(
+                        n, _opt_float(d.get("ovp")), _opt_float(d.get("ocp")), _opt_float(d.get("opp"))))
+                elif action == "clear_protection":
+                    self._send_json(ctrl.clear_protection(n))
+                else:
+                    self.send_error(404, "Not found")
             elif method == "GET":
                 self._serve_static(path)
             else:

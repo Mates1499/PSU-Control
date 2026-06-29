@@ -73,17 +73,90 @@ class Measurement:
         return f"{self.voltage:.4f} V, {self.current:.4f} A, {self.power:.4f} W"
 
 
+class Channel:
+    """A per-channel view of the supply for multi-channel / multi-unit systems.
+
+    Obtained from :meth:`ITN6332B.channel`. Every channel-specific operation
+    transparently selects this channel (``CHANnel <n>``) before issuing its
+    command, so you can drive several channels without juggling selection::
+
+        psu.channel(1).apply(12.0, 5.0)
+        psu.channel(2).apply(5.0, 1.0)
+        psu.channel(1).output_on()
+        print(psu.channel(2).measure())
+
+    All the channel-scoped methods of :class:`ITN6332B` (voltage/current/power
+    setpoints, ``apply``, priority, slew, output control, the protection suite
+    and measurements) are available here and behave identically, but pinned to
+    this channel.
+    """
+
+    # Channel-scoped members of ITN6332B that this proxy selects-then-delegates.
+    _DELEGATED = frozenset({
+        "set_voltage", "get_voltage", "voltage_range", "set_voltage_limits", "set_voltage_slew",
+        "set_current", "get_current", "current_range", "set_current_slew",
+        "set_power", "get_power", "apply",
+        "set_priority", "get_priority", "set_function_mode",
+        "output_on", "output_off", "set_output", "set_output_delays",
+        "set_ovp", "set_uvp", "set_ocp", "set_ucp", "set_opp", "clear_protection",
+        "questionable_condition", "protection_tripped", "raise_if_tripped",
+        "measure_voltage", "measure_current", "measure_power", "measure", "regulation_mode",
+    })
+
+    def __init__(self, psu: "ITN6332B", number: int):
+        object.__setattr__(self, "_psu", psu)
+        object.__setattr__(self, "number", number)
+
+    def select(self) -> None:
+        """Make this the active channel on the instrument."""
+        self._psu.select_channel(self.number)
+
+    @property
+    def available(self) -> bool:
+        """Whether the instrument for this channel is present/available."""
+        return self._psu.channel_available(self.number)
+
+    @property
+    def output_enabled(self) -> bool:
+        """Whether this channel's output is enabled."""
+        self.select()
+        return self._psu.output_enabled
+
+    def __getattr__(self, name: str):
+        # Only invoked for names not found normally. Delegate channel-scoped
+        # methods to the driver, selecting this channel first.
+        if name in Channel._DELEGATED:
+            psu = object.__getattribute__(self, "_psu")
+            number = object.__getattribute__(self, "number")
+            method = getattr(psu, name)
+
+            def bound(*args, **kwargs):
+                psu.select_channel(number)
+                return method(*args, **kwargs)
+
+            return bound
+        raise AttributeError(name)
+
+    def __repr__(self) -> str:
+        return f"Channel({self.number})"
+
+
 class ITN6332B:
     """Driver for an ITECH IT-N6332B bidirectional DC power supply.
 
     Open with :meth:`open_tcp`, :meth:`open_visa` or :meth:`open_usb`. Commands
-    act on the currently selected channel (default 1); use
-    :meth:`select_channel` for multi-unit / paralleled systems.
+    act on the currently selected channel (default 1). For multi-channel /
+    multi-unit (paralleled) systems, use :meth:`channel` to get a
+    :class:`Channel` proxy per channel, or :meth:`select_channel` to switch the
+    active channel for the driver's own methods.
     """
+
+    MAX_CHANNELS = 16  # CHANnel <n> accepts 1..16 per the programming guide
 
     def __init__(self, connection: ScpiConnection, *, channel: int = 1, claim_remote: bool = True):
         self.scpi = connection
         self._channel: Optional[int] = None
+        self._channel_cache: dict[int, "Channel"] = {}
         if claim_remote:
             try:
                 self.scpi.write("SYSTem:REMote")
@@ -160,13 +233,43 @@ class ITN6332B:
             self._channel = number
 
     @property
-    def channel(self) -> int:
-        """The currently selected channel number."""
+    def selected_channel(self) -> int:
+        """The currently selected channel number (see :meth:`select_channel`)."""
         return self._channel if self._channel is not None else 1
 
     def channel_available(self, number: int) -> bool:
         """Return whether the instrument for the given channel is present."""
         return self.scpi.query(f"CHANnel:STATe? {number}").strip() in ("1", "ON")
+
+    def channel(self, number: int) -> "Channel":
+        """Return a :class:`Channel` proxy for the given channel number (1-16)."""
+        if not 1 <= number <= self.MAX_CHANNELS:
+            raise ValueError(f"channel must be in 1..{self.MAX_CHANNELS}")
+        if number not in self._channel_cache:
+            self._channel_cache[number] = Channel(self, number)
+        return self._channel_cache[number]
+
+    def available_channels(self, max_channels: Optional[int] = None) -> list[int]:
+        """Discover which channels are present (via ``CHANnel:STATe?``).
+
+        Probes channels ``1..max_channels`` and returns those the instrument
+        reports as available. Channels that raise or report unavailable are
+        skipped. Always returns at least ``[1]`` so single-output units work
+        even if they don't implement the availability query.
+        """
+        limit = max_channels or self.MAX_CHANNELS
+        found: list[int] = []
+        for n in range(1, limit + 1):
+            try:
+                if self.channel_available(n):
+                    found.append(n)
+            except Exception:
+                break  # instrument rejected the query for this channel number
+        return found or [1]
+
+    def channels(self, max_channels: Optional[int] = None) -> list["Channel"]:
+        """Return :class:`Channel` proxies for all available channels."""
+        return [self.channel(n) for n in self.available_channels(max_channels)]
 
     # ------------------------------------------------------------------ #
     # Identification & housekeeping
@@ -473,6 +576,24 @@ class ITN6332B:
     # Saved states
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Multi-channel convenience
+    # ------------------------------------------------------------------ #
+
+    def all_output_on(self, channels: Optional[list[int]] = None) -> None:
+        """Enable the output on the given channels (default: all available)."""
+        for n in channels or self.available_channels():
+            self.channel(n).output_on()
+
+    def all_output_off(self, channels: Optional[list[int]] = None) -> None:
+        """Disable the output on the given channels (default: all available)."""
+        for n in channels or self.available_channels():
+            self.channel(n).output_off()
+
+    def measure_all(self, channels: Optional[list[int]] = None) -> dict[int, Measurement]:
+        """Return ``{channel_number: Measurement}`` for the given/all channels."""
+        return {n: self.channel(n).measure() for n in (channels or self.available_channels())}
+
     def save_state(self, slot: int) -> None:
         """Save the current setup to non-volatile memory ``slot`` (``*SAV``)."""
         self.scpi.write(f"*SAV {int(slot)}")
@@ -507,9 +628,14 @@ class ITN6332B:
         self.set_voltage(target)
 
     def shutdown(self) -> None:
-        """Safely turn the output off and return to local control."""
+        """Safely turn every available channel's output off, then go local."""
         try:
-            self.output_off()
+            self.all_output_off()
+        except Exception:
+            try:
+                self.output_off()
+            except Exception:
+                pass
         finally:
             self.local()
 
@@ -528,4 +654,4 @@ class ITN6332B:
         self.close()
 
     def __repr__(self) -> str:
-        return f"ITN6332B(ch={self.channel}, {self.scpi!r})"
+        return f"ITN6332B(ch={self.selected_channel}, {self.scpi!r})"

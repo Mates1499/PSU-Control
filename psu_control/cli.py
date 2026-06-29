@@ -34,17 +34,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="192.168.1.50", help="Instrument IP/hostname")
     p.add_argument("--port", type=int, default=DEFAULT_SCPI_PORT, help="Raw SCPI port (default 30000)")
     p.add_argument("--visa", help="Use a VISA resource string instead of TCP")
-    p.add_argument("--channel", type=int, default=1, help="Channel number (1-16, multi-unit systems)")
+    p.add_argument("--channel", type=int, default=1, help="Channel number (1-16); used by set/on/off/clear")
+    p.add_argument("--all", action="store_true", help="Apply on/off to every available channel")
     p.add_argument("--timeout", type=float, default=5.0, help="I/O timeout (s)")
 
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("idn", help="Print *IDN? identification")
     sub.add_parser("reset", help="Send *RST")
-    sub.add_parser("measure", help="Print measured V/I/P")
-    sub.add_parser("status", help="Print protection status")
-    sub.add_parser("on", help="Enable output")
-    sub.add_parser("off", help="Disable output")
-    sub.add_parser("clear", help="Clear latched protection")
+    sub.add_parser("channels", help="List available channels")
+    sub.add_parser("measure", help="Print measured V/I/P for all channels")
+    sub.add_parser("status", help="Print protection status for all channels")
+    sub.add_parser("on", help="Enable output (one channel, or --all)")
+    sub.add_parser("off", help="Disable output (one channel, or --all)")
+    sub.add_parser("clear", help="Clear latched protection on the selected channel")
 
     s = sub.add_parser("set", help="Set voltage/current/priority and optionally enable")
     s.add_argument("--voltage", type=float, help="Voltage setpoint (V)")
@@ -66,34 +68,45 @@ def run(args: argparse.Namespace) -> int:
             print(psu.idn())
         elif cmd == "reset":
             psu.reset(); print("Reset complete.")
+        elif cmd == "channels":
+            print("Available channels:", ", ".join(str(n) for n in psu.available_channels()))
         elif cmd == "measure":
-            print(psu.measure())
+            for n, m in psu.measure_all().items():
+                print(f"CH{n}: {m}")
         elif cmd == "status":
-            print("TRIPPED" if psu.protection_tripped() else "OK (no protection tripped)")
-        elif cmd == "on":
-            psu.output_on(); print("Output ON")
-        elif cmd == "off":
-            psu.output_off(); print("Output OFF")
+            for n in psu.available_channels():
+                tripped = psu.channel(n).protection_tripped()
+                print(f"CH{n}: {'TRIPPED' if tripped else 'OK'}")
+        elif cmd in ("on", "off"):
+            enable = cmd == "on"
+            if args.all:
+                psu.all_output_on() if enable else psu.all_output_off()
+                print(f"All outputs {'ON' if enable else 'OFF'}")
+            else:
+                psu.channel(args.channel).set_output(enable)
+                print(f"CH{args.channel} {'ON' if enable else 'OFF'}")
         elif cmd == "clear":
-            psu.clear_protection(); print("Protection cleared.")
+            psu.channel(args.channel).clear_protection()
+            print(f"CH{args.channel} protection cleared.")
         elif cmd == "set":
+            ch = psu.channel(args.channel)
             if args.priority:
-                psu.set_priority(_PRIORITY[args.priority])
+                ch.set_priority(_PRIORITY[args.priority])
             if args.voltage is not None and args.current is not None:
-                psu.apply(args.voltage, args.current)
+                ch.apply(args.voltage, args.current)
             else:
                 if args.voltage is not None:
-                    psu.set_voltage(args.voltage)
+                    ch.set_voltage(args.voltage)
                 if args.current is not None:
-                    psu.set_current(args.current)
+                    ch.set_current(args.current)
             if args.ovp is not None:
-                psu.set_ovp(args.ovp)
+                ch.set_ovp(args.ovp)
             if args.ocp is not None:
-                psu.set_ocp(args.ocp)
+                ch.set_ocp(args.ocp)
             if args.on:
-                psu.output_on()
+                ch.output_on()
             psu.check_errors()
-            print("Applied:", psu.measure())
+            print(f"CH{args.channel}:", ch.measure())
     finally:
         psu.close()
     return 0

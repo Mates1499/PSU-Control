@@ -82,12 +82,30 @@ psu.set_current_slew(positive=2.0, negative=1.0)
 i = psu.measure_current()                     # negative value => sinking
 ```
 
-### Multi-unit / channel addressing
+### Multiple channels
+
+The supply addresses channels with `CHANnel <n>` (1–16, for multi-output and
+linked multi-unit systems). Use the :class:`Channel` proxy from `psu.channel(n)`
+to drive each one independently — selection is handled for you:
 
 ```python
-psu.select_channel(2)                # CHANnel 2 (systems of linked units)
-print(psu.channel_available(2))      # CHANnel:STATe? 2
+print(psu.available_channels())      # e.g. [1, 2, 3]  (discovered live)
+
+psu.channel(1).apply(12.0, 5.0)      # each call selects its channel first
+psu.channel(2).apply(5.0, 1.0)
+psu.channel(1).output_on()
+psu.channel(2).set_priority(Priority.CURRENT)
+
+for n, m in psu.measure_all().items():
+    print(f"CH{n}: {m}")
+
+psu.all_output_on()                  # or all_output_off()
 ```
+
+A `Channel` exposes the same channel-scoped methods as the driver
+(`set_voltage`, `apply`, `set_ovp`, `measure`, `output_enabled`, …) plus
+`.available`. The driver's own methods still work and act on the currently
+selected channel (`psu.select_channel(n)`; `psu.selected_channel`).
 
 ## Web UI
 
@@ -105,14 +123,16 @@ python -m psu_control.web --port 8080 --host 0.0.0.0
 ```
 
 The dashboard provides connection (host/port, VISA, or one-click **Demo**),
-live V/I/P meters with a CV/CC badge, a real-time **signed** dual-trace chart
-(so sinking is visible below the midline), an OUTPUT toggle, CV/CC-priority
-voltage/current setpoints bounded by the device-reported ranges, and
-OVP/OCP/OPP plus clear-trip and `*RST`.
+**one card per detected channel**, each with live V/I/P meters, a CV/CC badge,
+a real-time **signed** dual-trace chart (so sinking is visible below the
+midline), an OUTPUT toggle, CV/CC-priority voltage/current setpoints bounded by
+the device-reported ranges, and OVP/OCP/OPP plus clear-trip. Master controls
+toggle all outputs at once and send `*RST`.
 
 The JSON REST API (`/api/state`, `/api/measure`, `/api/connect`,
-`/api/output`, `/api/setpoint`, `/api/protection`, `/api/clear_protection`,
-`/api/reset`) is documented in `psu_control/web/server.py`.
+`/api/all_output`, `/api/reset`, and per-channel
+`/api/channel/<n>/{setpoint,output,protection,clear_protection}`) is documented
+in `psu_control/web/server.py`.
 
 > The server binds to `127.0.0.1` by default and has no authentication. Use
 > `--host 0.0.0.0` to expose it on your LAN only on a trusted network.
@@ -121,9 +141,10 @@ The JSON REST API (`/api/state`, `/api/measure`, `/api/connect`,
 
 ```bash
 python -m psu_control.cli --host 192.168.1.50 idn
-python -m psu_control.cli --host 192.168.1.50 measure
-python -m psu_control.cli --host 192.168.1.50 set --voltage 12 --current 2 --priority cv --on
-python -m psu_control.cli --host 192.168.1.50 off
+python -m psu_control.cli --host 192.168.1.50 channels          # list channels
+python -m psu_control.cli --host 192.168.1.50 measure           # all channels
+python -m psu_control.cli --host 192.168.1.50 --channel 2 set --voltage 12 --current 2 --priority cv --on
+python -m psu_control.cli --host 192.168.1.50 --all off          # every channel
 ```
 
 ## API overview
@@ -132,7 +153,7 @@ python -m psu_control.cli --host 192.168.1.50 off
 |------|---------|
 | Identification | `idn`, `reset`, `clear_status`, `self_test`, `wait_complete`, `firmware_version` |
 | Remote/local | `remote`, `local`, `lock_local`, `beep` |
-| Channel | `select_channel`, `channel`, `channel_available` |
+| Channels | `channel(n)` → `Channel` proxy, `channels`, `available_channels`, `all_output_on/off`, `measure_all`, `select_channel`, `selected_channel`, `channel_available` |
 | Priority/mode | `set_priority`, `get_priority`, `set_function_mode` (`Priority`, `FunctionMode`) |
 | Voltage | `set_voltage`, `get_voltage`, `voltage_range`, `set_voltage_limits`, `set_voltage_slew` |
 | Current | `set_current`, `get_current`, `current_range`, `set_current_slew` |

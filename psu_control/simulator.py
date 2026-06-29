@@ -2,13 +2,16 @@
 
 It speaks the raw-socket protocol on a background thread so the real
 :class:`~psu_control.ScpiConnection` TCP backend can talk to it unchanged. It
-models a single bidirectional output (addressable as channel 1) driving a
-resistive load, with CV/CC priority, the protection suite, slew settings and
+models one or more bidirectional output channels with the ITECH ``CHANnel``
+selection handshake, CV/CC priority, the protection suite, slew settings and
 SCPI ``MIN`` / ``MAX`` range queries -- enough to exercise the driver, CLI and
-web UI without any physical instrument.
+multi-channel web UI without any physical instrument.
 
 It is *not* a precise electrical simulation. Use :class:`MockInstrument`
 directly, or the ``SimulatedInstrument`` alias.
+
+    MockInstrument()            # 3 channels by default
+    MockInstrument(channels=1)  # single-output unit
 """
 
 from __future__ import annotations
@@ -19,7 +22,7 @@ import socket
 import threading
 import time
 
-# Modelled instrument ratings (one bidirectional channel).
+# Per-channel ratings of the simulated unit.
 _V_MAX = 60.0
 _V_MIN = 0.0
 _I_MAX = 12.0    # sourcing
@@ -27,12 +30,29 @@ _I_MIN = -12.0   # sinking
 _P_MAX = 360.0
 
 
+def _new_channel_state() -> dict:
+    return {
+        "output": False,
+        "priority": "VOLT",
+        "mode": "FIX",
+        "voltage": 0.0,
+        "current": _I_MAX,
+        "power": _P_MAX,
+        "ovp": _V_MAX,
+        "ocp": _I_MAX,
+        "opp": _P_MAX,
+        "ovp_on": False,
+        "ques": 0,
+        "load": 12.0,   # resistive load when sourcing
+    }
+
+
 class MockInstrument:
-    """A tiny bidirectional SCPI responder. Context-manage to get ``(host, port)``."""
+    """A tiny multi-channel bidirectional SCPI responder."""
 
     IDN = "ITECH Ltd.,IT-N6332B,800001,1.05"
 
-    def __init__(self) -> None:
+    def __init__(self, channels: int = 3) -> None:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -42,21 +62,9 @@ class MockInstrument:
         self._running = True
 
         self.noise = False
-        self.load_ohms = 12.0     # resistive load when sourcing
-        self.channel = 1
-        self.state = {
-            "output": False,
-            "priority": "VOLT",
-            "mode": "FIX",
-            "voltage": 0.0,
-            "current": _I_MAX,
-            "power": _P_MAX,
-            "ovp": _V_MAX,
-            "ocp": _I_MAX,
-            "opp": _P_MAX,
-            "ovp_on": False,
-            "ques": 0,
-        }
+        self.num_channels = max(1, channels)
+        self.selected = 1
+        self.channels = {n: _new_channel_state() for n in range(1, self.num_channels + 1)}
         self.received: list[str] = []
 
     # -- lifecycle --------------------------------------------------------
@@ -109,19 +117,23 @@ class MockInstrument:
 
     # -- command handling -------------------------------------------------
 
+    def _cur(self) -> dict:
+        return self.channels.get(self.selected, self.channels[1])
+
     def _handle(self, cmd: str) -> str | None:
-        s = self.state
         up = cmd.upper()
 
-        # --- common / system ---
+        # --- common / system (channel-independent) ---
         if up == "*IDN?":
             return self.IDN
         if up == "*RST":
-            s.update(output=False, voltage=0.0, ques=0)
-            self.channel = 1
+            for st in self.channels.values():
+                st.update(output=False, voltage=0.0, ques=0)
+            self.selected = 1
             return None
         if up in ("*CLS", "SYSTEM:CLEAR"):
-            s["ques"] = 0
+            for st in self.channels.values():
+                st["ques"] = 0
             return None
         if up == "*OPC?":
             return "1"
@@ -134,27 +146,31 @@ class MockInstrument:
         if up.startswith("SYSTEM:") or up.startswith("*SAV") or up.startswith("*RCL"):
             return None
         if up in ("OUTPUT:PROTECTION:CLEAR", "OUTP:PROT:CLE"):
-            s["ques"] = 0
+            self._cur()["ques"] = 0
             return None
 
         head, _, value = cmd.partition(" ")
         head_u = head.upper()
-        # Queries attach "?" to the head (e.g. "VOLTage? MAX"); strip it so the
-        # base mnemonic can be matched against the setter tables below.
         is_query = head_u.endswith("?")
         base_head = head_u[:-1] if is_query else head_u
 
-        # --- channel selection ---
+        # --- channel selection / availability ---
         if head_u in ("CHANNEL", "CHAN", "INSTRUMENT:SELECT", "INSTRUMENT", "INST:SEL", "INST") and value:
             try:
-                self.channel = int(value)
+                self.selected = int(value)
             except ValueError:
                 pass
             return None
         if up in ("CHANNEL?", "CHAN?", "INSTRUMENT:SELECT?", "INSTRUMENT?", "INST:SEL?", "INST?"):
-            return str(self.channel)
-        if head_u in ("CHANNEL:STATE?", "CHAN:STAT?"):
-            return "1" if value.strip() in ("1", "") else "0"
+            return str(self.selected)
+        if base_head in ("CHANNEL:STATE", "CHAN:STAT") and is_query:
+            try:
+                n = int(value)
+            except ValueError:
+                n = self.selected
+            return "1" if 1 <= n <= self.num_channels else "0"
+
+        s = self._cur()
 
         # --- priority / mode ---
         if head_u in ("SOURCE:FUNCTION:PRIORITY", "FUNCTION:PRIORITY", "FUNC:PRI") and value:
@@ -166,17 +182,18 @@ class MockInstrument:
             s["mode"] = value.upper()[:3]
             return None
 
-        # --- setpoint writes (with MIN/MAX-aware queries below) ---
         base_v = ("SOURCE:VOLTAGE:LEVEL:IMMEDIATE:AMPLITUDE", "VOLTAGE", "VOLT", "SOURCE:VOLTAGE")
         base_i = ("SOURCE:CURRENT:LEVEL:IMMEDIATE:AMPLITUDE", "CURRENT", "CURR", "SOURCE:CURRENT")
         base_p = ("SOURCE:POWER:LEVEL:IMMEDIATE:AMPLITUDE", "POWER", "POW", "SOURCE:POWER")
-        if head_u in base_v and value and not value.endswith("?"):
+
+        # --- setpoint writes ---
+        if head_u in base_v and value and not is_query:
             s["voltage"] = self._clamp(value, _V_MIN, _V_MAX, s["voltage"])
             return None
-        if head_u in base_i and value and not value.endswith("?"):
+        if head_u in base_i and value and not is_query:
             s["current"] = self._clamp(value, _I_MIN, _I_MAX, s["current"])
             return None
-        if head_u in base_p and value and not value.endswith("?"):
+        if head_u in base_p and value and not is_query:
             s["power"] = self._clamp(value, 0.0, _P_MAX, s["power"])
             return None
 
@@ -191,9 +208,8 @@ class MockInstrument:
         if head_u == "SOURCE:VOLTAGE:PROTECTION:STATE" and value:
             s["ovp_on"] = value.upper() in ("ON", "1")
             return None
-        # accept (ignore) the various slew / limit / under-protection writes
         if any(k in head_u for k in (":SLEW", ":LIMIT", ":UNDER:", ":PROTECTION:", ":DELAY")) and value:
-            return None
+            return None  # accept-and-ignore slew/limit/under-protection writes
 
         if head_u in ("SOURCE:APPLY", "APPLY") and value:
             parts = [p for p in value.replace(",", " ").split() if p]
@@ -218,14 +234,14 @@ class MockInstrument:
         if up == "STATUS:QUESTIONABLE:CONDITION?":
             return str(s["ques"])
         if up in ("MEASURE:SCALAR:VOLTAGE:DC?", "MEAS:VOLT:DC?", "MEASURE:VOLTAGE?"):
-            return f"{self._measure()[0]:.4f}"
+            return f"{self._measure(s)[0]:.4f}"
         if up in ("MEASURE:SCALAR:CURRENT:DC?", "MEAS:CURR:DC?", "MEASURE:CURRENT?"):
-            return f"{self._measure()[1]:.4f}"
+            return f"{self._measure(s)[1]:.4f}"
         if up in ("MEASURE:SCALAR:POWER:DC?", "MEAS:POW:DC?", "MEASURE:POWER?"):
-            v, i = self._measure()
+            v, i = self._measure(s)
             return f"{v * i:.4f}"
         if up.startswith("FETCH"):
-            v, i = self._measure()
+            v, i = self._measure(s)
             if "CURR" in up:
                 return f"{i:.4f}"
             if "POW" in up:
@@ -259,16 +275,15 @@ class MockInstrument:
             return f"{lo:.4f}"
         return f"{current:.4f}"
 
-    def _measure(self) -> tuple[float, float]:
-        """Model the output into the load, honouring CC limiting."""
-        s = self.state
+    def _measure(self, s: dict) -> tuple[float, float]:
+        """Model a channel's output into its load, honouring CC limiting."""
         if not s["output"]:
             return 0.0, 0.0
         v = s["voltage"]
-        i = v / self.load_ohms
+        i = v / s["load"]
         if i > s["current"] > 0:  # constant-current limiting
             i = s["current"]
-            v = i * self.load_ohms
+            v = i * s["load"]
         if self.noise:
             t = time.monotonic()
             v += 0.01 * math.sin(t * 3.0) + random.uniform(-0.005, 0.005)
