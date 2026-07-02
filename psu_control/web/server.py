@@ -203,7 +203,9 @@ class Controller:
 
     def set_output(self, number: int, on: bool) -> dict[str, Any]:
         with self._lock:
-            self._require().channel(number).set_output(bool(on))
+            psu = self._require()
+            psu.channel(number).set_output(bool(on))
+            psu.check_errors()
         return self.measure()
 
     def set_protection(
@@ -233,6 +235,7 @@ class Controller:
         with self._lock:
             psu = self._require()
             psu.all_output_on() if on else psu.all_output_off()
+            psu.check_errors()
         return self.measure()
 
     def reset(self) -> dict[str, Any]:
@@ -259,12 +262,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, obj: Any, status: int = 200) -> None:
         body = json.dumps(obj).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client went away mid-response (e.g. tab closed during a poll)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -387,12 +393,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     p.add_argument("--host", default="127.0.0.1", help="Address to bind (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=8080, help="Port to listen on (default 8080)")
-    p.add_argument(
-        "--model",
-        default="itn6332b",
-        choices=list(_MODELS),
-        help="PSU model (default: itn6332b)",
-    )
     args = p.parse_args(argv)
 
     srv = create_server(args.host, args.port)
@@ -404,7 +404,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:
-        ctrl.disconnect()
+        srv.RequestHandlerClass.controller.disconnect()
         srv.server_close()
     return 0
 

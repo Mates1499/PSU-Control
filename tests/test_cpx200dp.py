@@ -1,8 +1,9 @@
 """Tests for the Aim-TTi CPX200DP driver, run against the in-process simulator.
 
 Tests verify that commands are correctly formatted for the suffix-addressed
-Aim-TTi ASCII command set (VSET1, ISET2, OUTPUT1, VOUT1?, etc.) and that
-the Channel proxy works correctly for independent dual-channel control.
+Aim-TTi ASCII command set (V1, I2, OP1, V1O?, OPALL, etc. — as documented in
+the CPX200D/DP instruction manual) and that the Channel proxy works correctly
+for independent dual-channel control.
 
 Run with::
 
@@ -44,7 +45,7 @@ def test_voltage_roundtrip():
         psu.select_channel(1)
         psu.set_voltage(15.0)
         assert abs(psu.get_voltage() - 15.0) < 0.01
-        assert any("VSET1 15.000" in r for r in sim.received)
+        assert any(r.startswith("V1 15.000") for r in sim.received)
         psu.close()
 
 
@@ -54,7 +55,7 @@ def test_current_roundtrip():
         psu.select_channel(1)
         psu.set_current(2.5)
         assert abs(psu.get_current() - 2.5) < 0.01
-        assert any("ISET1 2.500" in r for r in sim.received)
+        assert any(r.startswith("I1 2.500") for r in sim.received)
         psu.close()
 
 
@@ -123,15 +124,28 @@ def test_current_range_source_only():
 
 
 def test_channel_proxy_suffix_addressing():
-    """Each Channel proxy targets the correct suffix (VSET1 vs VSET2)."""
+    """Each Channel proxy targets the correct suffix (V1 vs V2)."""
     with CPX200DPSimulator() as sim:
         psu = _open(sim)
         psu.channel(1).set_voltage(10.0)
         psu.channel(2).set_voltage(20.0)
         assert abs(psu.channel(1).get_voltage() - 10.0) < 0.01
         assert abs(psu.channel(2).get_voltage() - 20.0) < 0.01
-        assert any("VSET1 10.000" in r for r in sim.received)
-        assert any("VSET2 20.000" in r for r in sim.received)
+        assert any(r.startswith("V1 10.000") for r in sim.received)
+        assert any(r.startswith("V2 20.000") for r in sim.received)
+        psu.close()
+
+
+def test_all_output_uses_opall():
+    """all_output_on/off with no subset must use the simultaneous OPALL command."""
+    with CPX200DPSimulator() as sim:
+        psu = _open(sim)
+        psu.all_output_on()
+        assert psu.channel(1).output_enabled and psu.channel(2).output_enabled
+        psu.all_output_off()
+        assert not psu.channel(1).output_enabled and not psu.channel(2).output_enabled
+        assert any(r.startswith("OPALL 1") for r in sim.received)
+        assert any(r.startswith("OPALL 0") for r in sim.received)
         psu.close()
 
 

@@ -59,7 +59,15 @@ class MockInstrument:
 
     IDN = "ITECH Ltd.,IT-N6332B,800001,1.05"
 
-    def __init__(self, channels: int = 3) -> None:
+    def __init__(self, channels: int = 3, dialect: str = "extended") -> None:
+        """``dialect`` mirrors the instrument's *System → Instructions* mode:
+
+        * ``"extended"`` (default) -- IT6300-compatible; channel select is
+          ``INST:NSEL <n>`` and the Standard forms raise error 150.
+        * ``"standard"`` -- IT-N6300 native; ``CHAN <n>`` / ``INST <n>`` work
+          and ``INST:NSEL`` raises error 150.
+        * ``"any"`` -- accept every form (lenient test double).
+        """
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._sock.bind(("127.0.0.1", 0))
@@ -69,10 +77,12 @@ class MockInstrument:
         self._running = True
 
         self.noise = False
+        self.dialect = dialect
         self.num_channels = max(1, channels)
         self.selected = 1
         self.channels = {n: _new_channel_state() for n in range(1, self.num_channels + 1)}
         self.received: list[str] = []
+        self.errors: list[tuple[int, str]] = []
 
     # -- lifecycle --------------------------------------------------------
 
@@ -141,12 +151,16 @@ class MockInstrument:
         if up in ("*CLS", "SYSTEM:CLEAR"):
             for st in self.channels.values():
                 st["ques"] = 0
+            self.errors.clear()
             return None
         if up == "*OPC?":
             return "1"
         if up == "*TST?":
             return "0"
         if up in ("SYSTEM:ERROR?", "SYST:ERR?"):
+            if self.errors:
+                code, msg = self.errors.pop(0)
+                return f'{code},"{msg}"'
             return '+0,"No error"'
         if up == "SYSTEM:VERSION?":
             return "1.0"
@@ -164,6 +178,11 @@ class MockInstrument:
         # --- channel selection / availability ---
         if head_u in ("CHANNEL", "CHAN", "INSTRUMENT:SELECT", "INSTRUMENT", "INST:SEL", "INST",
                       "INST:NSEL") and value:
+            is_extended_form = head_u in ("INST:NSEL", "INSTRUMENT:NSELECT")
+            if (self.dialect == "extended" and not is_extended_form) or \
+               (self.dialect == "standard" and is_extended_form):
+                self.errors.append((150, "Wrong parameter"))
+                return None
             try:
                 self.selected = int(value)
             except ValueError:
@@ -309,9 +328,11 @@ SimulatedInstrument = MockInstrument
 # -------------------------------------------------------------------------- #
 
 _CPX_V_MAX = 60.0
-_CPX_I_MAX = 3.5
+_CPX_I_MAX = 10.0
 
-_CMD_RE = re.compile(r"^([A-Z]+)(\d+)$")
+# Real Aim-TTi command grammar: a letter mnemonic, a channel digit, and an
+# optional trailing "O" (readback) — e.g. V1, I2, OP1, OVP2, LSR1, V1O.
+_CMD_RE = re.compile(r"^([A-Z]+?)(\d+)(O?)$")
 
 
 def _new_cpx_channel() -> dict:
@@ -329,8 +350,10 @@ def _new_cpx_channel() -> dict:
 class CPX200DPSimulator:
     """Tiny TCP responder simulating the Aim-TTi CPX200DP ASCII command set.
 
-    Two source-only channels (OUTPUT1/OUTPUT2) addressed via numeric command
-    suffixes (``VSET1``, ``ISET2``, ``VOUT1?``, etc.).
+    Speaks the documented remote commands: ``V<n>``/``I<n>`` setpoints
+    (queries reply prefixed, e.g. ``"V1 12.00"``), ``V<n>O?``/``I<n>O?``
+    readbacks with unit suffix (``"12.000V"``), ``OP<n>``, ``OPALL``,
+    ``OVP<n>``/``OCP<n>``, ``TRIPRST`` and read-and-clear ``LSR<n>?``.
     """
 
     IDN = "THURLBY THANDAR INSTRUMENTS,CPX200DP,000000,1.00"
@@ -412,60 +435,61 @@ class CPX200DPSimulator:
             return "1" if is_query else None
         if base_token == "*TST":
             return "0"
-        if base_token in ("LOCAL", "REMOTE", "LOCKOUT", "TRIPRST"):
+        if base_token == "OPALL":
+            on = value.strip() == "1"
+            for ch in self.channels.values():
+                ch["output"] = on
+            return None
+        if base_token in ("LOCAL", "IFLOCK", "IFUNLOCK", "TRIPRST"):
             if base_token == "TRIPRST":
                 for ch in self.channels.values():
                     ch["tripped"] = False
+            if base_token in ("IFLOCK", "IFUNLOCK"):
+                return "1" if base_token == "IFLOCK" else "0"
             return None
 
-        # --- suffix-addressed commands: CMD<n> or CMD<n>? ---
+        # --- suffix-addressed commands: CMD<n>[O][?] ---
         m = _CMD_RE.match(base_token)
         if not m:
             return "0" if is_query else None
-        cmd_name, n = m.group(1), int(m.group(2))
+        cmd_name, n, readback = m.group(1), int(m.group(2)), m.group(3)
         if n not in self.channels:
             return "0" if is_query else None
         ch = self.channels[n]
 
-        if cmd_name == "VSET":
-            if is_query:
-                return f"{ch['voltage']:.3f}"
+        if cmd_name == "V":
+            if readback and is_query:      # V<n>O?  -> "12.000V"
+                v, _ = self._measure(ch)
+                return f"{v:.3f}V"
+            if is_query:                   # V<n>?   -> "V<n> 12.00"
+                return f"V{n} {ch['voltage']:.2f}"
             try:
                 ch["voltage"] = max(0.0, min(_CPX_V_MAX, float(value)))
             except ValueError:
                 pass
             return None
 
-        if cmd_name == "ISET":
-            if is_query:
-                return f"{ch['current']:.3f}"
+        if cmd_name == "I":
+            if readback and is_query:      # I<n>O?  -> "1.000A"
+                _, i = self._measure(ch)
+                return f"{i:.3f}A"
+            if is_query:                   # I<n>?   -> "I<n> 1.000"
+                return f"I{n} {ch['current']:.3f}"
             try:
                 ch["current"] = max(0.0, min(_CPX_I_MAX, float(value)))
             except ValueError:
                 pass
             return None
 
-        if cmd_name == "VOUT":
-            if is_query:
-                v, _ = self._measure(ch)
-                return f"{v:.3f}"
-            return None
-
-        if cmd_name == "IOUT":
-            if is_query:
-                _, i = self._measure(ch)
-                return f"{i:.3f}"
-            return None
-
-        if cmd_name == "OUTPUT":
+        if cmd_name == "OP":
             if is_query:
                 return "1" if ch["output"] else "0"
-            ch["output"] = value.strip() in ("1", "ON")
+            ch["output"] = value.strip() == "1"
             return None
 
         if cmd_name == "OVP":
-            if is_query:
-                return f"{ch['ovp']:.3f}"
+            if is_query:                   # -> "VP<n> 13.50"
+                return f"VP{n} {ch['ovp']:.2f}"
             try:
                 ch["ovp"] = float(value)
             except ValueError:
@@ -473,8 +497,8 @@ class CPX200DPSimulator:
             return None
 
         if cmd_name == "OCP":
-            if is_query:
-                return f"{ch['ocp']:.3f}"
+            if is_query:                   # -> "CP<n> 2.500"
+                return f"CP{n} {ch['ocp']:.3f}"
             try:
                 ch["ocp"] = float(value)
             except ValueError:
@@ -482,7 +506,16 @@ class CPX200DPSimulator:
             return None
 
         if cmd_name == "LSR":
-            return "1" if ch["tripped"] else "0"
+            # Read-and-clear Limit Event Status Register.
+            # bit0 = CV, bit1 = CC, bit2 = OVP trip (used for any sim trip).
+            val = 0
+            if ch["output"]:
+                v = ch["voltage"]
+                cc = ch["load"] > 0 and v / ch["load"] > ch["current"] > 0
+                val |= 0x02 if cc else 0x01
+            if ch["tripped"]:
+                val |= 0x04
+            return str(val)
 
         return "0" if is_query else None
 

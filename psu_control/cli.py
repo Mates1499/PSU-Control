@@ -6,14 +6,14 @@ Supported models (--model flag):
 
 Examples::
 
-    python -m psu_control.cli --host 192.168.1.50 idn
-    python -m psu_control.cli --host 192.168.1.50 measure
-    python -m psu_control.cli --host 192.168.1.50 channels
-    python -m psu_control.cli --host 192.168.1.50 --channel 2 set --voltage 12 --current 2 --on
-    python -m psu_control.cli --host 192.168.1.50 --all off
+    python -m psu_control.cli --host 192.168.200.100 idn
+    python -m psu_control.cli --host 192.168.200.100 measure
+    python -m psu_control.cli --host 192.168.200.100 channels
+    python -m psu_control.cli --host 192.168.200.100 --channel 2 set --voltage 12 --current 2 --on
+    python -m psu_control.cli --host 192.168.200.100 --all off
 
-    python -m psu_control.cli --model cpx200dp --host 192.168.1.72 idn
-    python -m psu_control.cli --model cpx200dp --host 192.168.1.72 measure
+    python -m psu_control.cli --model cpx200dp --host 192.168.200.101 idn
+    python -m psu_control.cli --model cpx200dp --host 192.168.200.101 measure
 """
 
 from __future__ import annotations
@@ -50,7 +50,10 @@ def build_parser() -> argparse.ArgumentParser:
         prog="psu_control.cli",
         description="Control a programmable DC power supply over SCPI.",
     )
-    p.add_argument("--host", default="192.168.1.50", help="Instrument IP/hostname")
+    p.add_argument(
+        "--host", default="192.168.200.100",
+        help="Instrument IP/hostname (default: 192.168.200.100, the ITECH factory default)",
+    )
     p.add_argument(
         "--port", type=int, default=0,
         help="Raw SCPI port (default: model-specific; 30000 for IT-N6332B, 9221 for CPX200DP)",

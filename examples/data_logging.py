@@ -35,5 +35,5 @@ def log(host: str, duration_s: float, interval_s: float, path: str) -> None:
 
 
 if __name__ == "__main__":
-    host = sys.argv[1] if len(sys.argv) > 1 else "192.168.1.50"
+    host = sys.argv[1] if len(sys.argv) > 1 else "192.168.200.100"
     log(host, duration_s=10.0, interval_s=0.5, path="psu_log.csv")
