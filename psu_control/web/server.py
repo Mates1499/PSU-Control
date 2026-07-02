@@ -269,8 +269,11 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass  # client went away mid-response (e.g. tab closed during a poll)
+        except ConnectionError:
+            # Client went away mid-response (e.g. tab closed during a poll).
+            # ConnectionError covers BrokenPipeError, ConnectionResetError and
+            # ConnectionAbortedError (WinError 10053 on Windows).
+            self.close_connection = True
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0) or 0)
@@ -292,13 +295,16 @@ class _Handler(BaseHTTPRequestHandler):
         with open(full, "rb") as fh:
             body = fh.read()
         ext = os.path.splitext(full)[1].lower()
-        self.send_response(200)
-        self.send_header(
-            "Content-Type", _CONTENT_TYPES.get(ext, "application/octet-stream")
-        )
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", _CONTENT_TYPES.get(ext, "application/octet-stream")
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:
+            self.close_connection = True
 
     def _dispatch(self, method: str) -> None:
         ctrl = self.controller
@@ -351,6 +357,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._serve_static(path)
             else:
                 self.send_error(404, "Not found")
+        except ConnectionError:
+            # Aborted client socket surfacing outside _send_json (e.g. from
+            # send_error). Nothing useful can be written back; just drop it.
+            self.close_connection = True
         except PSUError as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=400)
         except (ValueError, TypeError) as exc:
