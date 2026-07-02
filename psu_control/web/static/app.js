@@ -4,8 +4,24 @@ const $ = (id) => document.getElementById(id);
 
 let connected = false;
 let pollTimer = null;
-const channels = {}; // number -> { el, history:[] }
+const channels = {}; // number -> { el, history:[], ranges:{} }
 const MAX_POINTS = 90;
+const POLL_MS = 500;
+
+const MODEL_INFO = {
+  itn6332b: {
+    title: "IT-N6332B",
+    sub: "ITECH Bidirectional DC Power Supply · SCPI",
+    host: "192.168.200.100",
+    port: 30000,
+  },
+  cpx200dp: {
+    title: "CPX200DP",
+    sub: "Aim-TTi Dual-Output DC Power Supply",
+    host: "192.168.200.101",
+    port: 9221,
+  },
+};
 
 async function api(path, body) {
   const opts = { method: body ? "POST" : "GET", headers: { "Content-Type": "application/json" } };
@@ -21,16 +37,24 @@ function toast(msg, isError) {
   t.textContent = msg;
   t.className = "toast show" + (isError ? " error" : "");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => (t.className = "toast"), 3200);
+  toast._t = setTimeout(() => (t.className = "toast"), 3600);
 }
 
 async function connect() {
+  const btn = $("btnConnect");
+  btn.disabled = true;
+  btn.textContent = "Connecting…";
   try {
     const model = $("model").value;
-    const body = { host: $("host").value, port: parseInt($("port").value, 10) || 0, visa: $("visa").value, model };
+    const body = { host: $("host").value.trim(), port: parseInt($("port").value, 10) || 0, visa: $("visa").value.trim(), model };
     onConnected(await api("/api/connect", body));
     toast("Connected");
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    btn.disabled = false;
+    toast(e.message, true);
+  } finally {
+    btn.textContent = "Connect";
+  }
 }
 
 async function disconnect() {
@@ -38,11 +62,6 @@ async function disconnect() {
   onDisconnected();
   toast("Disconnected");
 }
-
-const _MODEL_LABELS = {
-  "itn6332b": { title: "IT-N6332B", sub: "ITECH Bidirectional DC Power Supply · SCPI" },
-  "cpx200dp":  { title: "CPX200DP",  sub: "Aim-TTi Dual-Output DC Power Supply" },
-};
 
 function onConnected(st) {
   connected = true;
@@ -52,9 +71,9 @@ function onConnected(st) {
   $("btnConnect").disabled = true;
   $("btnDisconnect").disabled = false;
   ["btnAllOn", "btnAllOff", "btnReset"].forEach((id) => ($(id).disabled = false));
-  const lbl = _MODEL_LABELS[st.model] || { title: "PSU Control", sub: "Programmable DC Power Supply · SCPI" };
-  $("modelLabel").textContent = lbl.title;
-  $("modelSub").textContent = lbl.sub;
+  const info = MODEL_INFO[st.model] || { title: "PSU Control", sub: "Programmable DC Power Supply · SCPI" };
+  $("modelLabel").textContent = info.title;
+  $("modelSub").textContent = info.sub;
   buildChannels(st.channels || []);
   applyState(st);
   startPolling();
@@ -66,6 +85,8 @@ function onDisconnected() {
   $("connDot").classList.remove("on");
   $("connLabel").textContent = "Disconnected";
   $("idn").textContent = "";
+  $("modelLabel").textContent = "PSU Control";
+  $("modelSub").textContent = "Programmable DC Power Supply · SCPI";
   $("btnConnect").disabled = false;
   $("btnDisconnect").disabled = true;
   ["btnAllOn", "btnAllOff", "btnReset"].forEach((id) => ($(id).disabled = true));
@@ -84,11 +105,15 @@ function buildChannels(list) {
     const el = node.querySelector(".channel");
     el.querySelector(".ch-name").textContent = "Channel " + c.number;
 
+    const r = c.ranges || {};
     const sv = el.querySelector(".set-volt");
     const sc = el.querySelector(".set-curr");
-    const r = c.ranges || {};
     if (typeof r.v_max === "number") { sv.max = r.v_max; sv.min = r.v_min ?? 0; }
     if (typeof r.i_max === "number") { sc.max = r.i_max; sc.min = r.i_min ?? 0; }
+    if (typeof r.v_max === "number" && typeof r.i_max === "number") {
+      el.querySelector(".ch-range").textContent =
+        `${rangeText(r.v_min ?? 0, r.v_max)} V · ${rangeText(r.i_min ?? 0, r.i_max)} A`;
+    }
 
     el.querySelector(".btn-apply").onclick = () => applySetpoint(c.number, el);
     el.querySelector(".btn-prot").onclick = () => applyProtection(c.number, el);
@@ -96,8 +121,15 @@ function buildChannels(list) {
     el.querySelector(".btn-output").onclick = () => toggleOutput(c.number);
 
     host.appendChild(node);
-    channels[c.number] = { el, history: [] };
+    channels[c.number] = { el, history: [], ranges: r };
   });
+}
+
+function fmtRange(x) { return Number.isInteger(x) ? String(x) : String(+x.toFixed(2)); }
+
+function rangeText(lo, hi) {
+  if (lo < 0 && Math.abs(lo + hi) < 1e-9) return `±${fmtRange(hi)}`;   // symmetric bidirectional
+  return `${fmtRange(lo)}–${fmtRange(hi)}`;
 }
 
 function applyState(st) {
@@ -126,7 +158,13 @@ function renderMeasure(st) {
     ch.el.querySelector(".m-pow").textContent = fmt(m.power);
 
     const badge = ch.el.querySelector(".mode-badge");
-    if (c.mode) { badge.textContent = c.output ? c.mode : "—"; badge.className = "mode-badge " + (c.output ? c.mode.toLowerCase() : ""); }
+    if (c.output) {
+      badge.textContent = c.mode || "ON";
+      badge.className = "mode-badge " + (c.mode || "").toLowerCase();
+    } else {
+      badge.textContent = "OFF";
+      badge.className = "mode-badge";
+    }
     setOutputButton(ch.el.querySelector(".btn-output"), c.output);
 
     const ps = ch.el.querySelector(".prot-status");
@@ -148,14 +186,43 @@ function setOutputButton(btn, on) {
   btn.querySelector(".state").textContent = on ? "OUTPUT ON" : "OUTPUT OFF";
 }
 
-function numVal(el, sel) { const v = el.querySelector(sel).value.trim(); return v === "" ? null : parseFloat(v); }
+// Read a numeric input; clamp to the channel's rated range if one is known.
+// Returns { value, clamped } or null when the field is empty.
+function readClamped(el, sel) {
+  const input = el.querySelector(sel);
+  const raw = input.value.trim();
+  input.classList.remove("invalid");
+  if (raw === "") return null;
+  let v = parseFloat(raw);
+  if (!Number.isFinite(v)) {
+    input.classList.add("invalid");
+    throw new Error("Enter a valid number");
+  }
+  let clamped = false;
+  const lo = input.min !== "" ? parseFloat(input.min) : null;
+  const hi = input.max !== "" ? parseFloat(input.max) : null;
+  if (hi !== null && v > hi) { v = hi; clamped = true; }
+  if (lo !== null && v < lo) { v = lo; clamped = true; }
+  if (clamped) input.value = v.toFixed(3);
+  return { value: v, clamped };
+}
+
+function numVal(el, sel) {
+  const v = el.querySelector(sel).value.trim();
+  return v === "" ? null : parseFloat(v);
+}
 
 async function applySetpoint(n, el) {
   try {
+    const volt = readClamped(el, ".set-volt");
+    const curr = readClamped(el, ".set-curr");
+    if ((volt && volt.clamped) || (curr && curr.clamped)) {
+      toast(`CH${n}: value clamped to the rated range`, true);
+    }
     applyState(await api(`/api/channel/${n}/setpoint`, {
       priority: el.querySelector(".set-priority").value,
-      voltage: numVal(el, ".set-volt"),
-      current: numVal(el, ".set-curr"),
+      voltage: volt ? volt.value : null,
+      current: curr ? curr.value : null,
     }));
     toast(`CH${n} setpoints applied`);
   } catch (e) { toast(e.message, true); }
@@ -178,8 +245,10 @@ async function clearProtection(n) {
 async function toggleOutput(n) {
   const btn = channels[n].el.querySelector(".btn-output");
   const turningOn = !btn.classList.contains("on");
+  btn.disabled = true;
   try { renderMeasure(await api(`/api/channel/${n}/output`, { on: turningOn })); }
   catch (e) { toast(e.message, true); }
+  finally { btn.disabled = false; }
 }
 
 async function allOutput(on) {
@@ -195,15 +264,15 @@ async function reset() {
 
 function startPolling() {
   stopPolling();
-  pollTimer = setInterval(async () => { try { renderMeasure(await api("/api/measure")); } catch (e) {} }, 700);
+  pollTimer = setInterval(async () => { try { renderMeasure(await api("/api/measure")); } catch (e) {} }, POLL_MS);
 }
 function stopPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = null; }
 
 function drawChart(c, history) {
   const ctx = c.getContext("2d");
-  const W = c.width, H = c.height, pad = 14;
+  const W = c.width, H = c.height, pad = 12;
   ctx.clearRect(0, 0, W, H);
-  ctx.strokeStyle = "#2a323d"; ctx.lineWidth = 1;
+  ctx.strokeStyle = "#2b3442"; ctx.lineWidth = 1;
   for (let g = 0; g <= 2; g++) { const y = pad + (H - 2 * pad) * g / 2; ctx.beginPath(); ctx.moveTo(pad, y); ctx.lineTo(W - pad, y); ctx.stroke(); }
   if (history.length < 2) return;
   const vMax = Math.max(1, ...history.map((p) => Math.abs(p.v)));
@@ -217,9 +286,22 @@ function drawChart(c, history) {
     });
     ctx.stroke();
   };
-  plot("v", vMax, "#38bdf8");
-  plot("i", iMax, "#f59e0b");
+  plot("v", vMax, "#4cc3f7");
+  plot("i", iMax, "#f5a623");
 }
+
+// Model selector fills in that model's default host/port (only when the host
+// field still holds a default, so a hand-typed address is never overwritten).
+$("model").onchange = () => {
+  const info = MODEL_INFO[$("model").value];
+  if (!info) return;
+  const hostEl = $("host"), portEl = $("port");
+  const isDefault = hostEl.value.trim() === "" ||
+    Object.values(MODEL_INFO).some((m) => m.host === hostEl.value.trim());
+  if (isDefault) hostEl.value = info.host;
+  portEl.placeholder = info.port;
+  portEl.value = "";
+};
 
 $("btnConnect").onclick = connect;
 $("btnDisconnect").onclick = disconnect;

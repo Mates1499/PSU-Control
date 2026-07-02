@@ -1,23 +1,45 @@
 """Driver for the ITECH IT-N6332B / IT-N6300-series DC power supply.
 
 Uses the IT-N6300 short-form SCPI command set.  The IT-N6332B has **three
-independent channels** selected with ``INST:NSEL <1|2|3>``.
+independent channels**.
 
-Correct command forms for this instrument family::
+Command forms used::
 
-    INST:NSEL 1          # select channel (NOT "CHANnel 1")
+    INST:NSEL 1 / CHAN 1 / INST 1   # channel select (auto-detected, see below)
     VOLT 5.0             # set voltage   (NOT SOURce:VOLTage:LEVel:...)
     CURR 1.0             # set current   (NOT SOURce:CURRent:LEVel:...)
-    OUTP ON / OUTP OFF   # output enable (NOT OUTPut:STATe ON)
+    OUTP ON / OUTP OFF   # output enable, acts on the SELECTED channel
     VOLT? / CURR?        # read setpoints
     MEAS:VOLT? / MEAS:CURR?   # measure actual V / I
     SYST:ERR?            # drain error queue
+
+Channel-select dialect
+----------------------
+The instrument has two remote command modes (front panel: *System →
+Instructions*): **Standard** (the IT-N6300 set, channel select via
+``CHANnel <n>`` / ``INSTrument <n>``) and **Extended** (IT6300-compatible,
+channel select via ``INST:NSEL <n>``).  Sending the wrong form raises error
+150 ("wrong parameter").  On connect this driver probes which form the
+firmware accepts and uses it from then on, so it works in either mode.
+
+Per-channel output
+------------------
+``OUTP ON``/``OUTP OFF`` applies to the *currently selected* channel only.
+The driver re-asserts the channel selection before every command, so
+toggling channel 2 never touches channels 1 and 3.
+
+.. note::
+   If all three outputs still switch together, the instrument itself is
+   coupling them: check *System → Output Coupling* is **Off** (not ALL /
+   CH1-CH2 / …) and *Coupling* ([Shift]+[7]) is **Standard** — those
+   front-panel modes gang the outputs in hardware and cannot be overridden
+   over SCPI.
 
 Typical usage::
 
     from psu_control import ITN6332B, Priority
 
-    with ITN6332B.open_tcp("192.168.1.50") as psu:
+    with ITN6332B.open_tcp("192.168.200.100") as psu:
         print(psu.idn())
         psu.apply(12.0, 5.0)   # 12 V, 5 A limit on current channel
         psu.output_on()
@@ -65,6 +87,11 @@ class ITN6332B(BasePSUDriver):
     MAX_CHANNELS = 3        # IT-N6332B has 3 independent outputs
     DEFAULT_TCP_PORT = DEFAULT_SCPI_PORT  # 30000
 
+    # Channel-select command candidates, probed in order at connect time.
+    # "INST:NSEL" is the Extended (IT6300-compatible) form; "CHAN" and "INST"
+    # are the Standard IT-N6300 forms.  See the module docstring.
+    _SELECT_FORMS = ("INST:NSEL", "CHAN", "INST")
+
     def __init__(
         self,
         connection: ScpiConnection,
@@ -78,7 +105,28 @@ class ITN6332B(BasePSUDriver):
                 self.scpi.write("SYSTem:REMote")
             except Exception:
                 pass
+        self._select_cmd = self._detect_select_command()
         self.select_channel(channel)
+
+    def _detect_select_command(self) -> str:
+        """Probe which channel-select command this firmware accepts.
+
+        Writes each candidate followed by ``SYST:ERR?``; the first form that
+        leaves the error queue clean wins.  Falls back to the first candidate
+        if probing itself fails (e.g. an unusual transport).
+        """
+        try:
+            self.scpi.write("*CLS")
+            for form in self._SELECT_FORMS:
+                self.scpi.write(f"{form} 1")
+                code, _ = self.next_error()
+                if code == 0:
+                    return form
+                while code != 0:  # drain any follow-on errors
+                    code, _ = self.next_error()
+        except Exception:
+            pass
+        return self._SELECT_FORMS[0]
 
     # ------------------------------------------------------------------ #
     # Constructors
@@ -140,16 +188,22 @@ class ITN6332B(BasePSUDriver):
         )
 
     # ------------------------------------------------------------------ #
-    # Channel selection (INST:NSEL <n>, channels 1-3)
+    # Channel selection (auto-detected form, channels 1-3)
     # ------------------------------------------------------------------ #
 
     def select_channel(self, number: int) -> None:
-        """Select the active channel (1-3); cached to avoid redundant writes."""
+        """Select the active channel (1-3).
+
+        Always writes the selection (no caching): the front panel or another
+        controller can change the instrument's selected channel at any time,
+        and a stale cache would silently steer ``OUTP``/``VOLT``/``CURR`` at
+        the wrong channel.  One short extra write per operation is cheap
+        insurance for per-channel correctness.
+        """
         if not 1 <= number <= self.MAX_CHANNELS:
             raise ValueError(f"channel must be in 1..{self.MAX_CHANNELS}")
-        if self._channel != number:
-            self.scpi.write(f"INST:NSEL {number}")
-            self._channel = number
+        self.scpi.write(f"{self._select_cmd} {number}")
+        self._channel = number
 
     # ------------------------------------------------------------------ #
     # Identification & housekeeping

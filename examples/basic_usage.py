@@ -10,7 +10,7 @@ from psu_control import ITN6332B, Priority
 
 def main() -> None:
     # Raw TCP socket (no VISA required; ITECH default SCPI port is 30000):
-    psu = ITN6332B.open_tcp("192.168.1.50")
+    psu = ITN6332B.open_tcp("192.168.200.100")
     # ...or via VISA (USB/GPIB/LAN):
     # psu = ITN6332B.open_visa("USB0::0x2EC7::...::INSTR")
 

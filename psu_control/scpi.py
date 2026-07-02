@@ -4,7 +4,7 @@ This module provides :class:`ScpiConnection`, a thin transport abstraction that
 talks raw SCPI to the instrument. Two backends are supported:
 
 * **PyVISA** (recommended) -- handles USB-TMC, TCPIP/VXI-11, GPIB and serial via
-  a single resource string, e.g. ``TCPIP0::192.168.1.50::inst0::INSTR`` or
+  a single resource string, e.g. ``TCPIP0::192.168.200.100::inst0::INSTR`` or
   ``USB0::0x2EC7::0x6300::...::INSTR``.
 * **Raw TCP socket** -- a dependency-free fallback that speaks the SCPI raw
   socket protocol most ITECH instruments expose on TCP port 30000.
@@ -52,7 +52,7 @@ class ScpiConnection:
 
         Args:
             resource: A VISA resource string. Examples::
-                "TCPIP0::192.168.1.50::inst0::INSTR"
+                "TCPIP0::192.168.200.100::inst0::INSTR"
                 "USB0::0x2EC7::0x6300::800001::INSTR"
                 "GPIB0::5::INSTR"
                 "ASRL/dev/ttyUSB0::INSTR"

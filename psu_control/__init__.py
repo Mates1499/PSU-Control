@@ -12,7 +12,7 @@ Typical usage::
 
     from psu_control import ITN6332B, Priority
 
-    with ITN6332B.open_tcp("192.168.1.50") as psu:
+    with ITN6332B.open_tcp("192.168.200.100") as psu:
         psu.set_priority(Priority.VOLTAGE)
         psu.apply(12.0, 5.0)
         psu.output_on()
@@ -20,7 +20,7 @@ Typical usage::
 
     from psu_control import CPX200DP
 
-    with CPX200DP.open_tcp("192.168.1.72") as psu:
+    with CPX200DP.open_tcp("192.168.200.101") as psu:
         psu.channel(1).apply(12.0, 2.0)
         psu.channel(2).apply(5.0, 1.0)
         psu.all_output_on()

@@ -1,16 +1,31 @@
 """Driver for the Aim-TTi CPX200DP dual-channel programmable DC power supply.
 
-The CPX200DP is a two-output bench PSU that uses Aim-TTi's proprietary ASCII
-command set over LAN (TCP port 9221), USB or RS-232.  Unlike the ITECH command
-set, channels are addressed via a numeric **suffix** embedded in every command
-(``VSET1``/``VSET2``, ``ISET1``/``ISET2``, etc.) rather than a stateful
-channel-select command.
+The CPX200DP is a two-output bench PSU that uses Aim-TTi's ASCII remote command
+set over LAN (TCP port 9221), USB or RS-232.  Unlike the ITECH command set,
+channels are addressed via a numeric **suffix** embedded in every command
+rather than a stateful channel-select command.
+
+Command forms (from the CPX200D/DP Instruction Manual, "Remote Commands"):
+
+    V1 12.0        # set output 1 voltage
+    I1 2.0         # set output 1 current limit
+    V1?            # query setpoint  -> "V1 12.00"
+    I1?            # query limit     -> "I1 2.000"
+    V1O?           # measure voltage -> "12.000V"
+    I1O?           # measure current -> "1.000A"
+    OP1 1 / OP1 0  # output 1 on/off
+    OP1?           # -> "1" or "0"
+    OPALL 1|0      # all outputs on/off simultaneously
+    OVP1 13.5      # over-voltage trip point; query -> "VP1 13.50"
+    OCP1 2.5       # over-current trip point; query -> "CP1 2.500"
+    TRIPRST        # attempt to clear all trip conditions
+    LSR1?          # query-and-clear Limit Event Status Register 1
 
 Typical usage::
 
     from psu_control import CPX200DP
 
-    with CPX200DP.open_tcp("192.168.1.72") as psu:
+    with CPX200DP.open_tcp("192.168.200.101") as psu:
         print(psu.idn())
         psu.channel(1).apply(12.0, 2.0)
         psu.channel(2).apply(5.0, 1.0)
@@ -26,14 +41,23 @@ from __future__ import annotations
 from typing import Optional
 
 from .base import BasePSUDriver, Measurement
+from .exceptions import PSUCommandError
 from .scpi import DEFAULT_TIMEOUT_S, ScpiConnection
 
-# Aim-TTi LAN SCPI port (CPX / QPX series default).
+# Aim-TTi LAN port (CPX / QPX / PL series default).
 CPX_TCP_PORT = 9221
 
-# Per-channel electrical limits for the CPX200DP.
+# Per-channel electrical limits for the CPX200DP (60 V / 10 A, 180 W per output).
 _V_MAX = 60.0
-_I_MAX = 3.5
+_I_MAX = 10.0
+
+# Limit Event Status Register bits (per manual "Status Reporting"):
+#   bit 0 = CV mode          bit 1 = CC mode
+#   bit 2 = OVP trip         bit 3 = OCP trip
+#   bit 4 = power limit      bit 6 = hard trip (front-panel/power-cycle reset)
+_LSR_CV = 0x01
+_LSR_CC = 0x02
+_LSR_TRIP_MASK = 0x4C   # OVP | OCP | hard trip
 
 
 class CPX200DP(BasePSUDriver):
@@ -45,8 +69,8 @@ class CPX200DP(BasePSUDriver):
         psu.channel(1).apply(12.0, 2.0)
         psu.channel(2).apply(5.0, 1.0)
 
-    Channel commands embed the output number directly in the SCPI mnemonic
-    (``VSET1``, ``VSET2``, etc.) so no separate channel-select write is needed.
+    Channel commands embed the output number directly in the mnemonic
+    (``V1``, ``OP2``, etc.) so no separate channel-select write is needed.
     """
 
     MAX_CHANNELS = 2
@@ -59,10 +83,9 @@ class CPX200DP(BasePSUDriver):
     def __init__(self, connection: ScpiConnection) -> None:
         super().__init__(connection)
         self._channel = 1
-        try:
-            self.scpi.write("REMOTE")
-        except Exception:
-            pass
+        # LSR reads clear the register, so latch trip bits per channel to
+        # avoid losing a trip between polls.
+        self._trip_latch: dict[int, int] = {1: 0, 2: 0}
 
     # ------------------------------------------------------------------ #
     # Constructors
@@ -117,6 +140,20 @@ class CPX200DP(BasePSUDriver):
         """Return the currently selected channel number (1 or 2)."""
         return self._channel if self._channel is not None else 1
 
+    @staticmethod
+    def _parse_reply(reply: str) -> float:
+        """Parse a value out of an Aim-TTi response.
+
+        Setpoint queries return a prefixed form (``"V1 12.00"``); readback
+        queries return a unit-suffixed form (``"12.000V"``).  Both are handled.
+        """
+        token = reply.strip().split()[-1] if reply.strip() else ""
+        token = token.rstrip("VvAaWw")
+        try:
+            return float(token)
+        except ValueError:
+            raise PSUCommandError(-1, f"Unparseable instrument reply: {reply!r}")
+
     # ------------------------------------------------------------------ #
     # Identification & housekeeping
     # ------------------------------------------------------------------ #
@@ -126,35 +163,35 @@ class CPX200DP(BasePSUDriver):
         return self.scpi.query("*IDN?")
 
     def reset(self) -> None:
-        """Reset the instrument to its power-on defaults (``*RST``)."""
+        """Reset the instrument to its remote-control defaults (``*RST``)."""
         self.scpi.write("*RST")
         self._channel = 1
+        self._trip_latch = {1: 0, 2: 0}
 
     def clear_status(self) -> None:
         self.scpi.write("*CLS")
 
-    def remote(self) -> None:
-        """Enter remote control mode (``REMOTE``)."""
-        self.scpi.write("REMOTE")
-
     def local(self) -> None:
         """Return to local (front-panel) control (``LOCAL``)."""
         self.scpi.write("LOCAL")
+
+    # ``remote()`` stays a no-op: the CPX enters remote automatically on the
+    # first command; the manual defines no REMOTE command.
 
     # ------------------------------------------------------------------ #
     # Voltage
     # ------------------------------------------------------------------ #
 
     def set_voltage(self, volts: float) -> None:
-        """Set the voltage setpoint for the active channel (``VSET<n> <v>``)."""
-        self.scpi.write(f"VSET{self._n()} {volts:.3f}")
+        """Set the voltage setpoint for the active channel (``V<n> <v>``)."""
+        self.scpi.write(f"V{self._n()} {volts:.3f}")
 
     def get_voltage(self) -> float:
-        """Query the voltage setpoint for the active channel (``VSET<n>?``)."""
-        return float(self.scpi.query(f"VSET{self._n()}?"))
+        """Query the voltage setpoint (``V<n>?`` -> ``"V<n> <val>"``)."""
+        return self._parse_reply(self.scpi.query(f"V{self._n()}?"))
 
     def voltage_range(self) -> tuple[float, float]:
-        """Return the (min, max) programmable voltage (hard-coded for CPX200DP)."""
+        """Return the (min, max) programmable voltage (rated for CPX200DP)."""
         return (0.0, self.VOLTAGE_MAX)
 
     # ------------------------------------------------------------------ #
@@ -162,15 +199,15 @@ class CPX200DP(BasePSUDriver):
     # ------------------------------------------------------------------ #
 
     def set_current(self, amps: float) -> None:
-        """Set the current limit for the active channel (``ISET<n> <a>``)."""
-        self.scpi.write(f"ISET{self._n()} {amps:.3f}")
+        """Set the current limit for the active channel (``I<n> <a>``)."""
+        self.scpi.write(f"I{self._n()} {amps:.3f}")
 
     def get_current(self) -> float:
-        """Query the current limit for the active channel (``ISET<n>?``)."""
-        return float(self.scpi.query(f"ISET{self._n()}?"))
+        """Query the current limit (``I<n>?`` -> ``"I<n> <val>"``)."""
+        return self._parse_reply(self.scpi.query(f"I{self._n()}?"))
 
     def current_range(self) -> tuple[float, float]:
-        """Return the (min, max) programmable current (hard-coded for CPX200DP).
+        """Return the (min, max) programmable current (rated for CPX200DP).
 
         The CPX200DP is source-only; minimum is 0 (not negative).
         """
@@ -190,17 +227,31 @@ class CPX200DP(BasePSUDriver):
     # ------------------------------------------------------------------ #
 
     def output_on(self) -> None:
-        """Enable the active channel's output (``OUTPUT<n> 1``)."""
-        self.scpi.write(f"OUTPUT{self._n()} 1")
+        """Enable the active channel's output (``OP<n> 1``)."""
+        self.scpi.write(f"OP{self._n()} 1")
 
     def output_off(self) -> None:
-        """Disable the active channel's output (``OUTPUT<n> 0``)."""
-        self.scpi.write(f"OUTPUT{self._n()} 0")
+        """Disable the active channel's output (``OP<n> 0``)."""
+        self.scpi.write(f"OP{self._n()} 0")
 
     @property
     def output_enabled(self) -> bool:
         """Whether the active channel's output is currently enabled."""
-        return self.scpi.query(f"OUTPUT{self._n()}?").strip() in ("1", "ON")
+        return self.scpi.query(f"OP{self._n()}?").strip() == "1"
+
+    def all_output_on(self, channels: Optional[list[int]] = None) -> None:
+        """Enable outputs; uses ``OPALL 1`` (simultaneous) when no subset given."""
+        if channels:
+            super().all_output_on(channels)
+        else:
+            self.scpi.write("OPALL 1")
+
+    def all_output_off(self, channels: Optional[list[int]] = None) -> None:
+        """Disable outputs; uses ``OPALL 0`` (simultaneous) when no subset given."""
+        if channels:
+            super().all_output_off(channels)
+        else:
+            self.scpi.write("OPALL 0")
 
     # ------------------------------------------------------------------ #
     # Protection
@@ -215,31 +266,38 @@ class CPX200DP(BasePSUDriver):
         self.scpi.write(f"OCP{self._n()} {amps:.3f}")
 
     def clear_protection(self) -> None:
-        """Reset all trip conditions (``TRIPRST``)."""
+        """Reset all trip conditions (``TRIPRST``) and the local trip latch."""
         self.scpi.write("TRIPRST")
+        self._trip_latch[self._n()] = 0
+
+    def _read_lsr(self) -> int:
+        """Read-and-clear this channel's Limit Event Status Register."""
+        try:
+            return int(self.scpi.query(f"LSR{self._n()}?").strip())
+        except ValueError:
+            return 0
 
     def protection_tripped(self) -> bool:
         """Whether the active channel has a tripped protection condition.
 
-        Reads ``LSR<n>?`` (Limit Status Register); any non-zero value means
-        a protection or regulation event has occurred.
+        ``LSR<n>?`` clears on read, so trip bits are latched locally until
+        :meth:`clear_protection` is called.
         """
-        try:
-            return int(self.scpi.query(f"LSR{self._n()}?").strip()) != 0
-        except (ValueError, Exception):
-            return False
+        n = self._n()
+        self._trip_latch[n] |= self._read_lsr() & _LSR_TRIP_MASK
+        return self._trip_latch[n] != 0
 
     # ------------------------------------------------------------------ #
     # Measurements
     # ------------------------------------------------------------------ #
 
     def measure_voltage(self) -> float:
-        """Measure the actual output voltage on the active channel (``VOUT<n>?``)."""
-        return float(self.scpi.query(f"VOUT{self._n()}?"))
+        """Measure the output voltage (``V<n>O?`` -> ``"<val>V"``)."""
+        return self._parse_reply(self.scpi.query(f"V{self._n()}O?"))
 
     def measure_current(self) -> float:
-        """Measure the actual output current on the active channel (``IOUT<n>?``)."""
-        return float(self.scpi.query(f"IOUT{self._n()}?"))
+        """Measure the output current (``I<n>O?`` -> ``"<val>A"``)."""
+        return self._parse_reply(self.scpi.query(f"I{self._n()}O?"))
 
     def measure(self) -> Measurement:
         """Return a :class:`Measurement` snapshot for the active channel."""

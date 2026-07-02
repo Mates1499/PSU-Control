@@ -37,6 +37,44 @@ def test_selects_channel_on_open():
         psu.close()
 
 
+def test_dialect_autodetect_extended_mode():
+    """Default mock speaks the Extended (IT6300) dialect -> INST:NSEL wins."""
+    with MockInstrument(dialect="extended") as mock:
+        psu = _open(mock)
+        psu.channel(2).set_voltage(5.0)
+        assert abs(psu.channel(2).get_voltage() - 5.0) < 1e-3
+        assert mock.selected == 2
+        assert psu.next_error()[0] == 0    # no queued channel-select errors
+        psu.close()
+
+
+def test_dialect_autodetect_standard_mode():
+    """Standard-mode firmware rejects INST:NSEL (error 150) -> CHAN is used."""
+    with MockInstrument(dialect="standard") as mock:
+        psu = _open(mock)
+        psu.channel(2).set_voltage(5.0)
+        assert abs(psu.channel(2).get_voltage() - 5.0) < 1e-3
+        assert mock.selected == 2
+        assert any(c.upper().startswith("CHAN 2") for c in mock.received)
+        assert psu.next_error()[0] == 0    # probe drained its own errors
+        psu.close()
+
+
+def test_output_toggles_only_selected_channel():
+    """OUTP must always be preceded by an explicit channel select."""
+    with MockInstrument(channels=3) as mock:
+        psu = _open(mock)
+        psu.channel(2).output_on()
+        assert psu.channel(2).output_enabled is True
+        assert psu.channel(1).output_enabled is False
+        assert psu.channel(3).output_enabled is False
+        # the select is re-asserted immediately before the OUTP write
+        cmds = [c.upper() for c in mock.received]
+        idx = max(i for i, c in enumerate(cmds) if c.startswith("OUTP ON"))
+        assert cmds[idx - 1] == "INST:NSEL 2"
+        psu.close()
+
+
 def test_voltage_roundtrip():
     with MockInstrument() as mock:
         psu = _open(mock)
